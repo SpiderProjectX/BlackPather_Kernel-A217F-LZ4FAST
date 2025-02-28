@@ -1,1440 +1,1850 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * hugetlbpage-backed filesystem.  Based on ramfs.
+ * linux/ipc/shm.c
+ * Copyright (C) 1992, 1993 Krishna Balasubramanian
+ *	 Many improvements/fixes by Bruno Haible.
+ * Replaced `struct shm_desc' by `struct vm_area_struct', July 1994.
+ * Fixed the shm swap deallocation (shm_unuse()), August 1998 Andrea Arcangeli.
  *
- * Nadia Yvette Chambers, 2002
+ * /proc/sysvipc/shm support (c) 1999 Dragos Acostachioaie <dragos@iname.com>
+ * BIGMEM support, Andrea Arcangeli <andrea@suse.de>
+ * SMP thread shm, Jean-Luc Boyard <jean-luc.boyard@siemens.fr>
+ * HIGHMEM support, Ingo Molnar <mingo@redhat.com>
+ * Make shmmax, shmall, shmmni sysctl'able, Christoph Rohland <cr@sap.com>
+ * Shared /dev/zero support, Kanoj Sarcar <kanoj@sgi.com>
+ * Move the mm functionality over to mm/shmem.c, Christoph Rohland <cr@sap.com>
  *
- * Copyright (C) 2002 Linus Torvalds.
- * License: GPL
+ * support for audit of ipc object properties and permission changes
+ * Dustin Kirkland <dustin.kirkland@us.ibm.com>
+ *
+ * namespaces support
+ * OpenVZ, SWsoft Inc.
+ * Pavel Emelianov <xemul@openvz.org>
+ *
+ * Better ipc lock (kern_ipc_perm.lock) handling
+ * Davidlohr Bueso <davidlohr.bueso@hp.com>, June 2013.
  */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
-#include <linux/thread_info.h>
-#include <asm/current.h>
-#include <linux/sched/signal.h>		/* remove ASAP */
-#include <linux/falloc.h>
-#include <linux/fs.h>
-#include <linux/mount.h>
-#include <linux/file.h>
-#include <linux/kernel.h>
-#include <linux/writeback.h>
-#include <linux/pagemap.h>
-#include <linux/highmem.h>
-#include <linux/init.h>
-#include <linux/string.h>
-#include <linux/capability.h>
-#include <linux/ctype.h>
-#include <linux/backing-dev.h>
-#include <linux/hugetlb.h>
-#include <linux/pagevec.h>
-#include <linux/parser.h>
-#include <linux/mman.h>
 #include <linux/slab.h>
-#include <linux/dnotify.h>
-#include <linux/statfs.h>
+#include <linux/mm.h>
+#include <linux/hugetlb.h>
+#include <linux/shm.h>
+#include <linux/init.h>
+#include <linux/file.h>
+#include <linux/mman.h>
+#include <linux/shmem_fs.h>
 #include <linux/security.h>
-#include <linux/magic.h>
-#include <linux/migrate.h>
-#include <linux/uio.h>
+#include <linux/syscalls.h>
+#include <linux/audit.h>
+#include <linux/capability.h>
+#include <linux/ptrace.h>
+#include <linux/seq_file.h>
+#include <linux/rwsem.h>
+#include <linux/nsproxy.h>
+#include <linux/mount.h>
+#include <linux/ipc_namespace.h>
+#include <linux/rhashtable.h>
 
 #include <linux/uaccess.h>
 
-static const struct super_operations hugetlbfs_ops;
-static const struct address_space_operations hugetlbfs_aops;
-const struct file_operations hugetlbfs_file_operations;
-static const struct inode_operations hugetlbfs_dir_inode_operations;
-static const struct inode_operations hugetlbfs_inode_operations;
+#include "util.h"
 
-struct hugetlbfs_config {
-	struct hstate		*hstate;
-	long			max_hpages;
-	long			nr_inodes;
-	long			min_hpages;
-	kuid_t			uid;
-	kgid_t			gid;
-	umode_t			mode;
-};
-
-int sysctl_hugetlb_shm_group;
-
-enum {
-	Opt_size, Opt_nr_inodes,
-	Opt_mode, Opt_uid, Opt_gid,
-	Opt_pagesize, Opt_min_size,
-	Opt_err,
-};
-
-static const match_table_t tokens = {
-	{Opt_size,	"size=%s"},
-	{Opt_nr_inodes,	"nr_inodes=%s"},
-	{Opt_mode,	"mode=%o"},
-	{Opt_uid,	"uid=%u"},
-	{Opt_gid,	"gid=%u"},
-	{Opt_pagesize,	"pagesize=%s"},
-	{Opt_min_size,	"min_size=%s"},
-	{Opt_err,	NULL},
-};
-
-#ifdef CONFIG_NUMA
-static inline void hugetlb_set_vma_policy(struct vm_area_struct *vma,
-					struct inode *inode, pgoff_t index)
+struct shmid_kernel /* private to the kernel */
 {
-	vma->vm_policy = mpol_shared_policy_lookup(&HUGETLBFS_I(inode)->policy,
-							index);
+	struct kern_ipc_perm	shm_perm;
+	struct file		*shm_file;
+	unsigned long		shm_nattch;
+	unsigned long		shm_segsz;
+	time64_t		shm_atim;
+	time64_t		shm_dtim;
+	time64_t		shm_ctim;
+	struct pid		*shm_cprid;
+	struct pid		*shm_lprid;
+	struct user_struct	*mlock_user;
+
+	/*
+	 * The task created the shm object, for
+	 * task_lock(shp->shm_creator)
+	 */
+	struct task_struct	*shm_creator;
+
+	/*
+	 * List by creator. task_lock(->shm_creator) required for read/write.
+	 * If list_empty(), then the creator is dead already.
+	 */
+	struct list_head	shm_clist;
+	struct ipc_namespace	*ns;
+} __randomize_layout;
+
+/* shm_mode upper byte flags */
+#define SHM_DEST	01000	/* segment will be destroyed on last detach */
+#define SHM_LOCKED	02000   /* segment will not be swapped */
+
+struct shm_file_data {
+	int id;
+	struct ipc_namespace *ns;
+	struct file *file;
+	const struct vm_operations_struct *vm_ops;
+};
+
+#define shm_file_data(file) (*((struct shm_file_data **)&(file)->private_data))
+
+static const struct file_operations shm_file_operations;
+static const struct vm_operations_struct shm_vm_ops;
+
+#define shm_ids(ns)	((ns)->ids[IPC_SHM_IDS])
+
+#define shm_unlock(shp)			\
+	ipc_unlock(&(shp)->shm_perm)
+
+static int newseg(struct ipc_namespace *, struct ipc_params *);
+static void shm_open(struct vm_area_struct *vma);
+static void shm_close(struct vm_area_struct *vma);
+static void shm_destroy(struct ipc_namespace *ns, struct shmid_kernel *shp);
+#ifdef CONFIG_PROC_FS
+static int sysvipc_shm_proc_show(struct seq_file *s, void *it);
+#endif
+
+void shm_init_ns(struct ipc_namespace *ns)
+{
+	ns->shm_ctlmax = SHMMAX;
+	ns->shm_ctlall = SHMALL;
+	ns->shm_ctlmni = SHMMNI;
+	ns->shm_rmid_forced = 0;
+	ns->shm_tot = 0;
+	ipc_init_ids(&shm_ids(ns));
 }
 
-static inline void hugetlb_drop_vma_policy(struct vm_area_struct *vma)
+/*
+ * Called with shm_ids.rwsem (writer) and the shp structure locked.
+ * Only shm_ids.rwsem remains locked on exit.
+ */
+static void do_shm_rmid(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp)
 {
-	mpol_cond_put(vma->vm_policy);
+	struct shmid_kernel *shp;
+
+	shp = container_of(ipcp, struct shmid_kernel, shm_perm);
+	WARN_ON(ns != shp->ns);
+
+	if (shp->shm_nattch) {
+		shp->shm_perm.mode |= SHM_DEST;
+		/* Do not find it any more */
+		ipc_set_key_private(&shm_ids(ns), &shp->shm_perm);
+		shm_unlock(shp);
+	} else
+		shm_destroy(ns, shp);
 }
+
+#ifdef CONFIG_IPC_NS
+void shm_exit_ns(struct ipc_namespace *ns)
+{
+	free_ipcs(ns, &shm_ids(ns), do_shm_rmid);
+	idr_destroy(&ns->ids[IPC_SHM_IDS].ipcs_idr);
+	rhashtable_destroy(&ns->ids[IPC_SHM_IDS].key_ht);
+}
+#endif
+
+static int __init ipc_ns_init(void)
+{
+	shm_init_ns(&init_ipc_ns);
+	return 0;
+}
+
+pure_initcall(ipc_ns_init);
+
+void __init shm_init(void)
+{
+	ipc_init_proc_interface("sysvipc/shm",
+#if BITS_PER_LONG <= 32
+				"       key      shmid perms       size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime        rss       swap\n",
 #else
-static inline void hugetlb_set_vma_policy(struct vm_area_struct *vma,
-					struct inode *inode, pgoff_t index)
-{
-}
-
-static inline void hugetlb_drop_vma_policy(struct vm_area_struct *vma)
-{
-}
+				"       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
 #endif
+				IPC_SHM_IDS, sysvipc_shm_proc_show);
+}
 
-static void huge_pagevec_release(struct pagevec *pvec)
+static inline struct shmid_kernel *shm_obtain_object(struct ipc_namespace *ns, int id)
 {
-	int i;
+	struct kern_ipc_perm *ipcp = ipc_obtain_object_idr(&shm_ids(ns), id);
 
-	for (i = 0; i < pagevec_count(pvec); ++i)
-		put_page(pvec->pages[i]);
+	if (IS_ERR(ipcp))
+		return ERR_CAST(ipcp);
 
-	pagevec_reinit(pvec);
+	return container_of(ipcp, struct shmid_kernel, shm_perm);
+}
+
+static inline struct shmid_kernel *shm_obtain_object_check(struct ipc_namespace *ns, int id)
+{
+	struct kern_ipc_perm *ipcp = ipc_obtain_object_check(&shm_ids(ns), id);
+
+	if (IS_ERR(ipcp))
+		return ERR_CAST(ipcp);
+
+	return container_of(ipcp, struct shmid_kernel, shm_perm);
 }
 
 /*
- * Mask used when checking the page offset value passed in via system
- * calls.  This value will be converted to a loff_t which is signed.
- * Therefore, we want to check the upper PAGE_SHIFT + 1 bits of the
- * value.  The extra bit (- 1 in the shift value) is to take the sign
- * bit into account.
+ * shm_lock_(check_) routines are called in the paths where the rwsem
+ * is not necessarily held.
  */
-#define PGOFF_LOFFT_MAX \
-	(((1UL << (PAGE_SHIFT + 1)) - 1) <<  (BITS_PER_LONG - (PAGE_SHIFT + 1)))
-
-static int hugetlbfs_file_mmap(struct file *file, struct vm_area_struct *vma)
+static inline struct shmid_kernel *shm_lock(struct ipc_namespace *ns, int id)
 {
-	struct inode *inode = file_inode(file);
-	loff_t len, vma_len;
-	int ret;
-	struct hstate *h = hstate_file(file);
+	struct kern_ipc_perm *ipcp;
 
-	/*
-	 * vma address alignment (but not the pgoff alignment) has
-	 * already been checked by prepare_hugepage_range.  If you add
-	 * any error returns here, do so after setting VM_HUGETLB, so
-	 * is_vm_hugetlb_page tests below unmap_region go the right
-	  * way when do_mmap unwinds (may be important on powerpc
-	 * and ia64).
-	 */
-	vma->vm_flags |= VM_HUGETLB | VM_DONTEXPAND;
-	vma->vm_ops = &hugetlb_vm_ops;
+	rcu_read_lock();
+	ipcp = ipc_obtain_object_idr(&shm_ids(ns), id);
+	if (IS_ERR(ipcp))
+		goto err;
 
+	ipc_lock_object(ipcp);
 	/*
-	 * page based offset in vm_pgoff could be sufficiently large to
-	 * overflow a loff_t when converted to byte offset.  This can
-	 * only happen on architectures where sizeof(loff_t) ==
-	 * sizeof(unsigned long).  So, only check in those instances.
+	 * ipc_rmid() may have already freed the ID while ipc_lock_object()
+	 * was spinning: here verify that the structure is still valid.
+	 * Upon races with RMID, return -EIDRM, thus indicating that
+	 * the ID points to a removed identifier.
 	 */
-	if (sizeof(unsigned long) == sizeof(loff_t)) {
-		if (vma->vm_pgoff & PGOFF_LOFFT_MAX)
-			return -EINVAL;
+	if (ipc_valid_object(ipcp)) {
+		/* return a locked ipc object upon success */
+		return container_of(ipcp, struct shmid_kernel, shm_perm);
 	}
 
-	/* must be huge page aligned */
-	if (vma->vm_pgoff & (~huge_page_mask(h) >> PAGE_SHIFT))
-		return -EINVAL;
+	ipc_unlock_object(ipcp);
+	ipcp = ERR_PTR(-EIDRM);
+err:
+	rcu_read_unlock();
+	/*
+	 * Callers of shm_lock() must validate the status of the returned ipc
+	 * object pointer and error out as appropriate.
+	 */
+	return ERR_CAST(ipcp);
+}
 
-	vma_len = (loff_t)(vma->vm_end - vma->vm_start);
-	len = vma_len + ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
-	/* check for overflow */
-	if (len < vma_len)
-		return -EINVAL;
+static inline void shm_lock_by_ptr(struct shmid_kernel *ipcp)
+{
+	rcu_read_lock();
+	ipc_lock_object(&ipcp->shm_perm);
+}
 
-	inode_lock(inode);
-	file_accessed(file);
-
-	ret = -ENOMEM;
-	if (hugetlb_reserve_pages(inode,
-				vma->vm_pgoff >> huge_page_order(h),
-				len >> huge_page_shift(h), vma,
-				vma->vm_flags))
-		goto out;
-
-	ret = 0;
-	if (vma->vm_flags & VM_WRITE && inode->i_size < len)
-		i_size_write(inode, len);
-out:
-	inode_unlock(inode);
-
-	return ret;
+static void shm_rcu_free(struct rcu_head *head)
+{
+	struct kern_ipc_perm *ptr = container_of(head, struct kern_ipc_perm,
+							rcu);
+	struct shmid_kernel *shp = container_of(ptr, struct shmid_kernel,
+							shm_perm);
+	security_shm_free(&shp->shm_perm);
+	kvfree(shp);
 }
 
 /*
- * Called under down_write(mmap_sem).
+ * It has to be called with shp locked.
+ * It must be called before ipc_rmid()
  */
-
-#ifndef HAVE_ARCH_HUGETLB_UNMAPPED_AREA
-static unsigned long
-hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
-		unsigned long len, unsigned long pgoff, unsigned long flags)
+static inline void shm_clist_rm(struct shmid_kernel *shp)
 {
-	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma;
-	struct hstate *h = hstate_file(file);
-	struct vm_unmapped_area_info info;
+	struct task_struct *creator;
 
-	if (len & ~huge_page_mask(h))
-		return -EINVAL;
-	if (len > TASK_SIZE)
-		return -ENOMEM;
-
-	if (flags & MAP_FIXED) {
-		if (prepare_hugepage_range(file, addr, len))
-			return -EINVAL;
-		return addr;
-	}
-
-	if (addr) {
-		addr = ALIGN(addr, huge_page_size(h));
-		vma = find_vma(mm, addr);
-		if (TASK_SIZE - len >= addr &&
-		    (!vma || addr + len <= vm_start_gap(vma)))
-			return addr;
-	}
-
-	info.flags = 0;
-	info.length = len;
-	info.low_limit = TASK_UNMAPPED_BASE;
-	info.high_limit = TASK_SIZE;
-	info.align_mask = PAGE_MASK & ~huge_page_mask(h);
-	info.align_offset = 0;
-	return vm_unmapped_area(&info);
-}
-#endif
-
-static size_t
-hugetlbfs_read_actor(struct page *page, unsigned long offset,
-			struct iov_iter *to, unsigned long size)
-{
-	size_t copied = 0;
-	int i, chunksize;
-
-	/* Find which 4k chunk and offset with in that chunk */
-	i = offset >> PAGE_SHIFT;
-	offset = offset & ~PAGE_MASK;
-
-	while (size) {
-		size_t n;
-		chunksize = PAGE_SIZE;
-		if (offset)
-			chunksize -= offset;
-		if (chunksize > size)
-			chunksize = size;
-		n = copy_page_to_iter(&page[i], offset, chunksize, to);
-		copied += n;
-		if (n != chunksize)
-			return copied;
-		offset = 0;
-		size -= chunksize;
-		i++;
-	}
-	return copied;
-}
-
-/*
- * Support for read() - Find the page attached to f_mapping and copy out the
- * data. Its *very* similar to do_generic_mapping_read(), we can't use that
- * since it has PAGE_SIZE assumptions.
- */
-static ssize_t hugetlbfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
-{
-	struct file *file = iocb->ki_filp;
-	struct hstate *h = hstate_file(file);
-	struct address_space *mapping = file->f_mapping;
-	struct inode *inode = mapping->host;
-	unsigned long index = iocb->ki_pos >> huge_page_shift(h);
-	unsigned long offset = iocb->ki_pos & ~huge_page_mask(h);
-	unsigned long end_index;
-	loff_t isize;
-	ssize_t retval = 0;
-
-	while (iov_iter_count(to)) {
-		struct page *page;
-		size_t nr, copied;
-
-		/* nr is the maximum number of bytes to copy from this page */
-		nr = huge_page_size(h);
-		isize = i_size_read(inode);
-		if (!isize)
-			break;
-		end_index = (isize - 1) >> huge_page_shift(h);
-		if (index > end_index)
-			break;
-		if (index == end_index) {
-			nr = ((isize - 1) & ~huge_page_mask(h)) + 1;
-			if (nr <= offset)
-				break;
-		}
-		nr = nr - offset;
-
-		/* Find the page */
-		page = find_lock_page(mapping, index);
-		if (unlikely(page == NULL)) {
-			/*
-			 * We have a HOLE, zero out the user-buffer for the
-			 * length of the hole or request.
-			 */
-			copied = iov_iter_zero(nr, to);
-		} else {
-			unlock_page(page);
-
-			/*
-			 * We have the page, copy it to user space buffer.
-			 */
-			copied = hugetlbfs_read_actor(page, offset, to, nr);
-			put_page(page);
-		}
-		offset += copied;
-		retval += copied;
-		if (copied != nr && iov_iter_count(to)) {
-			if (!retval)
-				retval = -EFAULT;
-			break;
-		}
-		index += offset >> huge_page_shift(h);
-		offset &= ~huge_page_mask(h);
-	}
-	iocb->ki_pos = ((loff_t)index << huge_page_shift(h)) + offset;
-	return retval;
-}
-
-static int hugetlbfs_write_begin(struct file *file,
-			struct address_space *mapping,
-			loff_t pos, unsigned len, unsigned flags,
-			struct page **pagep, void **fsdata)
-{
-	return -EINVAL;
-}
-
-static int hugetlbfs_write_end(struct file *file, struct address_space *mapping,
-			loff_t pos, unsigned len, unsigned copied,
-			struct page *page, void *fsdata)
-{
-	BUG();
-	return -EINVAL;
-}
-
-static void remove_huge_page(struct page *page)
-{
-	ClearPageDirty(page);
-	ClearPageUptodate(page);
-	delete_from_page_cache(page);
-}
-
-static void
-hugetlb_vmdelete_list(struct rb_root_cached *root, pgoff_t start, pgoff_t end)
-{
-	struct vm_area_struct *vma;
+	/* ensure that shm_creator does not disappear */
+	rcu_read_lock();
 
 	/*
-	 * end == 0 indicates that the entire range after
-	 * start should be unmapped.
+	 * A concurrent exit_shm may do a list_del_init() as well.
+	 * Just do nothing if exit_shm already did the work
 	 */
-	vma_interval_tree_foreach(vma, root, start, end ? end : ULONG_MAX) {
-		unsigned long v_offset;
-		unsigned long v_end;
-
+	if (!list_empty(&shp->shm_clist)) {
 		/*
-		 * Can the expression below overflow on 32-bit arches?
-		 * No, because the interval tree returns us only those vmas
-		 * which overlap the truncated area starting at pgoff,
-		 * and no vma on a 32-bit arch can span beyond the 4GB.
+		 * shp->shm_creator is guaranteed to be valid *only*
+		 * if shp->shm_clist is not empty.
 		 */
-		if (vma->vm_pgoff < start)
-			v_offset = (start - vma->vm_pgoff) << PAGE_SHIFT;
-		else
-			v_offset = 0;
+		creator = shp->shm_creator;
 
-		if (!end)
-			v_end = vma->vm_end;
-		else {
-			v_end = ((end - vma->vm_pgoff) << PAGE_SHIFT)
-							+ vma->vm_start;
-			if (v_end > vma->vm_end)
-				v_end = vma->vm_end;
-		}
-
-		unmap_hugepage_range(vma, vma->vm_start + v_offset, v_end,
-									NULL);
+		task_lock(creator);
+		/*
+		 * list_del_init() is a nop if the entry was already removed
+		 * from the list.
+		 */
+		list_del_init(&shp->shm_clist);
+		task_unlock(creator);
 	}
+	rcu_read_unlock();
+}
+
+static inline void shm_rmid(struct shmid_kernel *s)
+{
+	shm_clist_rm(s);
+	ipc_rmid(&shm_ids(s->ns), &s->shm_perm);
+}
+
+
+static int __shm_open(struct vm_area_struct *vma)
+{
+	struct file *file = vma->vm_file;
+	struct shm_file_data *sfd = shm_file_data(file);
+	struct shmid_kernel *shp;
+
+	shp = shm_lock(sfd->ns, sfd->id);
+
+	if (IS_ERR(shp))
+		return PTR_ERR(shp);
+
+	if (shp->shm_file != sfd->file) {
+		/* ID was reused */
+		shm_unlock(shp);
+		return -EINVAL;
+	}
+
+	shp->shm_atim = ktime_get_real_seconds();
+	ipc_update_pid(&shp->shm_lprid, task_tgid(current));
+	shp->shm_nattch++;
+	shm_unlock(shp);
+	return 0;
+}
+
+/* This is called by fork, once for every shm attach. */
+static void shm_open(struct vm_area_struct *vma)
+{
+	int err = __shm_open(vma);
+	/*
+	 * We raced in the idr lookup or with shm_destroy().
+	 * Either way, the ID is busted.
+	 */
+	WARN_ON_ONCE(err);
 }
 
 /*
- * remove_inode_hugepages handles two distinct cases: truncation and hole
- * punch.  There are subtle differences in operation for each case.
+ * shm_destroy - free the struct shmid_kernel
  *
- * truncation is indicated by end of range being LLONG_MAX
- *	In this case, we first scan the range and release found pages.
- *	After releasing pages, hugetlb_unreserve_pages cleans up region/reserv
- *	maps and global counts.  Page faults can not race with truncation
- *	in this routine.  hugetlb_no_page() prevents page faults in the
- *	truncated range.  It checks i_size before allocation, and again after
- *	with the page table lock for the page held.  The same lock must be
- *	acquired to unmap a page.
- * hole punch is indicated if end is not LLONG_MAX
- *	In the hole punch case we scan the range and release found pages.
- *	Only when releasing a page is the associated region/reserv map
- *	deleted.  The region/reserv map for ranges without associated
- *	pages are not modified.  Page faults can race with hole punch.
- *	This is indicated if we find a mapped page.
- * Note: If the passed end of range value is beyond the end of file, but
- * not LLONG_MAX this routine still performs a hole punch operation.
+ * @ns: namespace
+ * @shp: struct to free
+ *
+ * It has to be called with shp and shm_ids.rwsem (writer) locked,
+ * but returns with shp unlocked and freed.
  */
-static void remove_inode_hugepages(struct inode *inode, loff_t lstart,
-				   loff_t lend)
+static void shm_destroy(struct ipc_namespace *ns, struct shmid_kernel *shp)
 {
-	struct hstate *h = hstate_inode(inode);
-	struct address_space *mapping = &inode->i_data;
-	const pgoff_t start = lstart >> huge_page_shift(h);
-	const pgoff_t end = lend >> huge_page_shift(h);
-	struct vm_area_struct pseudo_vma;
-	struct pagevec pvec;
-	pgoff_t next, index;
-	int i, freed = 0;
-	bool truncate_op = (lend == LLONG_MAX);
+	struct file *shm_file;
 
-	vma_init(&pseudo_vma, current->mm);
-	pseudo_vma.vm_flags = (VM_HUGETLB | VM_MAYSHARE | VM_SHARED);
-	pagevec_init(&pvec);
-	next = start;
-	while (next < end) {
-		/*
-		 * When no more pages are found, we are done.
-		 */
-		if (!pagevec_lookup_range(&pvec, mapping, &next, end - 1))
-			break;
-
-		for (i = 0; i < pagevec_count(&pvec); ++i) {
-			struct page *page = pvec.pages[i];
-			u32 hash;
-
-			index = page->index;
-			hash = hugetlb_fault_mutex_hash(h, mapping, index, 0);
-			mutex_lock(&hugetlb_fault_mutex_table[hash]);
-
-			/*
-			 * If page is mapped, it was faulted in after being
-			 * unmapped in caller.  Unmap (again) now after taking
-			 * the fault mutex.  The mutex will prevent faults
-			 * until we finish removing the page.
-			 *
-			 * This race can only happen in the hole punch case.
-			 * Getting here in a truncate operation is a bug.
-			 */
-			if (unlikely(page_mapped(page))) {
-				BUG_ON(truncate_op);
-
-				i_mmap_lock_write(mapping);
-				hugetlb_vmdelete_list(&mapping->i_mmap,
-					index * pages_per_huge_page(h),
-					(index + 1) * pages_per_huge_page(h));
-				i_mmap_unlock_write(mapping);
-			}
-
-			lock_page(page);
-			/*
-			 * We must free the huge page and remove from page
-			 * cache (remove_huge_page) BEFORE removing the
-			 * region/reserve map (hugetlb_unreserve_pages).  In
-			 * rare out of memory conditions, removal of the
-			 * region/reserve map could fail. Correspondingly,
-			 * the subpool and global reserve usage count can need
-			 * to be adjusted.
-			 */
-			VM_BUG_ON(PagePrivate(page));
-			remove_huge_page(page);
-			freed++;
-			if (!truncate_op) {
-				if (unlikely(hugetlb_unreserve_pages(inode,
-							index, index + 1, 1)))
-					hugetlb_fix_reserve_counts(inode);
-			}
-
-			unlock_page(page);
-			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
-		}
-		huge_pagevec_release(&pvec);
-		cond_resched();
-	}
-
-	if (truncate_op)
-		(void)hugetlb_unreserve_pages(inode, start, LONG_MAX, freed);
-}
-
-static void hugetlbfs_evict_inode(struct inode *inode)
-{
-	struct resv_map *resv_map;
-
-	remove_inode_hugepages(inode, 0, LLONG_MAX);
-	resv_map = (struct resv_map *)inode->i_mapping->private_data;
-	/* root inode doesn't have the resv_map, so we should check it */
-	if (resv_map)
-		resv_map_release(&resv_map->refs);
-	clear_inode(inode);
-}
-
-static int hugetlb_vmtruncate(struct inode *inode, loff_t offset)
-{
-	pgoff_t pgoff;
-	struct address_space *mapping = inode->i_mapping;
-	struct hstate *h = hstate_inode(inode);
-
-	BUG_ON(offset & ~huge_page_mask(h));
-	pgoff = offset >> PAGE_SHIFT;
-
-	i_size_write(inode, offset);
-	i_mmap_lock_write(mapping);
-	if (!RB_EMPTY_ROOT(&mapping->i_mmap.rb_root))
-		hugetlb_vmdelete_list(&mapping->i_mmap, pgoff, 0);
-	i_mmap_unlock_write(mapping);
-	remove_inode_hugepages(inode, offset, LLONG_MAX);
-	return 0;
-}
-
-static long hugetlbfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
-{
-	struct hstate *h = hstate_inode(inode);
-	loff_t hpage_size = huge_page_size(h);
-	loff_t hole_start, hole_end;
-
-	/*
-	 * For hole punch round up the beginning offset of the hole and
-	 * round down the end.
-	 */
-	hole_start = round_up(offset, hpage_size);
-	hole_end = round_down(offset + len, hpage_size);
-
-	if (hole_end > hole_start) {
-		struct address_space *mapping = inode->i_mapping;
-		struct hugetlbfs_inode_info *info = HUGETLBFS_I(inode);
-
-		inode_lock(inode);
-
-		/* protected by i_mutex */
-		if (info->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) {
-			inode_unlock(inode);
-			return -EPERM;
-		}
-
-		i_mmap_lock_write(mapping);
-		if (!RB_EMPTY_ROOT(&mapping->i_mmap.rb_root))
-			hugetlb_vmdelete_list(&mapping->i_mmap,
-						hole_start >> PAGE_SHIFT,
-						hole_end  >> PAGE_SHIFT);
-		i_mmap_unlock_write(mapping);
-		remove_inode_hugepages(inode, hole_start, hole_end);
-		inode_unlock(inode);
-	}
-
-	return 0;
-}
-
-static long hugetlbfs_fallocate(struct file *file, int mode, loff_t offset,
-				loff_t len)
-{
-	struct inode *inode = file_inode(file);
-	struct hugetlbfs_inode_info *info = HUGETLBFS_I(inode);
-	struct address_space *mapping = inode->i_mapping;
-	struct hstate *h = hstate_inode(inode);
-	struct vm_area_struct pseudo_vma;
-	struct mm_struct *mm = current->mm;
-	loff_t hpage_size = huge_page_size(h);
-	unsigned long hpage_shift = huge_page_shift(h);
-	pgoff_t start, index, end;
-	int error;
-	u32 hash;
-
-	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
-		return -EOPNOTSUPP;
-
-	if (mode & FALLOC_FL_PUNCH_HOLE)
-		return hugetlbfs_punch_hole(inode, offset, len);
-
-	/*
-	 * Default preallocate case.
-	 * For this range, start is rounded down and end is rounded up
-	 * as well as being converted to page offsets.
-	 */
-	start = offset >> hpage_shift;
-	end = (offset + len + hpage_size - 1) >> hpage_shift;
-
-	inode_lock(inode);
-
-	/* We need to check rlimit even when FALLOC_FL_KEEP_SIZE */
-	error = inode_newsize_ok(inode, offset + len);
-	if (error)
-		goto out;
-
-	if ((info->seals & F_SEAL_GROW) && offset + len > inode->i_size) {
-		error = -EPERM;
-		goto out;
-	}
-
-	/*
-	 * Initialize a pseudo vma as this is required by the huge page
-	 * allocation routines.  If NUMA is configured, use page index
-	 * as input to create an allocation policy.
-	 */
-	vma_init(&pseudo_vma, mm);
-	pseudo_vma.vm_flags = (VM_HUGETLB | VM_MAYSHARE | VM_SHARED);
-	pseudo_vma.vm_file = file;
-
-	for (index = start; index < end; index++) {
-		/*
-		 * This is supposed to be the vaddr where the page is being
-		 * faulted in, but we have no vaddr here.
-		 */
-		struct page *page;
-		unsigned long addr;
-		int avoid_reserve = 0;
-
-		cond_resched();
-
-		/*
-		 * fallocate(2) manpage permits EINTR; we may have been
-		 * interrupted because we are using up too much memory.
-		 */
-		if (signal_pending(current)) {
-			error = -EINTR;
-			break;
-		}
-
-		/* Set numa allocation policy based on index */
-		hugetlb_set_vma_policy(&pseudo_vma, inode, index);
-
-		/* addr is the offset within the file (zero based) */
-		addr = index * hpage_size;
-
-		/* mutex taken here, fault path and hole punch */
-		hash = hugetlb_fault_mutex_hash(h, mapping, index, addr);
-		mutex_lock(&hugetlb_fault_mutex_table[hash]);
-
-		/* See if already present in mapping to avoid alloc/free */
-		page = find_get_page(mapping, index);
-		if (page) {
-			put_page(page);
-			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
-			hugetlb_drop_vma_policy(&pseudo_vma);
-			continue;
-		}
-
-		/* Allocate page and add to page cache */
-		page = alloc_huge_page(&pseudo_vma, addr, avoid_reserve);
-		hugetlb_drop_vma_policy(&pseudo_vma);
-		if (IS_ERR(page)) {
-			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
-			error = PTR_ERR(page);
-			goto out;
-		}
-		clear_huge_page(page, addr, pages_per_huge_page(h));
-		__SetPageUptodate(page);
-		error = huge_add_to_page_cache(page, mapping, index);
-		if (unlikely(error)) {
-			put_page(page);
-			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
-			goto out;
-		}
-
-		mutex_unlock(&hugetlb_fault_mutex_table[hash]);
-
-		/*
-		 * unlock_page because locked by add_to_page_cache()
-		 * page_put due to reference from alloc_huge_page()
-		 */
-		unlock_page(page);
-		put_page(page);
-	}
-
-	if (!(mode & FALLOC_FL_KEEP_SIZE) && offset + len > inode->i_size)
-		i_size_write(inode, offset + len);
-	inode->i_ctime = current_time(inode);
-out:
-	inode_unlock(inode);
-	return error;
-}
-
-static int hugetlbfs_setattr(struct dentry *dentry, struct iattr *attr)
-{
-	struct inode *inode = d_inode(dentry);
-	struct hstate *h = hstate_inode(inode);
-	int error;
-	unsigned int ia_valid = attr->ia_valid;
-	struct hugetlbfs_inode_info *info = HUGETLBFS_I(inode);
-
-	BUG_ON(!inode);
-
-	error = setattr_prepare(dentry, attr);
-	if (error)
-		return error;
-
-	if (ia_valid & ATTR_SIZE) {
-		loff_t oldsize = inode->i_size;
-		loff_t newsize = attr->ia_size;
-
-		if (newsize & ~huge_page_mask(h))
-			return -EINVAL;
-		/* protected by i_mutex */
-		if ((newsize < oldsize && (info->seals & F_SEAL_SHRINK)) ||
-		    (newsize > oldsize && (info->seals & F_SEAL_GROW)))
-			return -EPERM;
-		error = hugetlb_vmtruncate(inode, newsize);
-		if (error)
-			return error;
-	}
-
-	setattr_copy(inode, attr);
-	mark_inode_dirty(inode);
-	return 0;
-}
-
-static struct inode *hugetlbfs_get_root(struct super_block *sb,
-					struct hugetlbfs_config *config)
-{
-	struct inode *inode;
-
-	inode = new_inode(sb);
-	if (inode) {
-		inode->i_ino = get_next_ino();
-		inode->i_mode = S_IFDIR | config->mode;
-		inode->i_uid = config->uid;
-		inode->i_gid = config->gid;
-		inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
-		inode->i_op = &hugetlbfs_dir_inode_operations;
-		inode->i_fop = &simple_dir_operations;
-		/* directory inodes start off with i_nlink == 2 (for "." entry) */
-		inc_nlink(inode);
-		lockdep_annotate_inode_mutex_key(inode);
-	}
-	return inode;
+	shm_file = shp->shm_file;
+	shp->shm_file = NULL;
+	ns->shm_tot -= (shp->shm_segsz + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	shm_rmid(shp);
+	shm_unlock(shp);
+	if (!is_file_hugepages(shm_file))
+		shmem_lock(shm_file, 0, shp->mlock_user);
+	else if (shp->mlock_user)
+		user_shm_unlock(i_size_read(file_inode(shm_file)),
+				shp->mlock_user);
+	fput(shm_file);
+	ipc_update_pid(&shp->shm_cprid, NULL);
+	ipc_update_pid(&shp->shm_lprid, NULL);
+	ipc_rcu_putref(&shp->shm_perm, shm_rcu_free);
 }
 
 /*
- * Hugetlbfs is not reclaimable; therefore its i_mmap_rwsem will never
- * be taken from reclaim -- unlike regular filesystems. This needs an
- * annotation because huge_pmd_share() does an allocation under hugetlb's
- * i_mmap_rwsem.
+ * shm_may_destroy - identifies whether shm segment should be destroyed now
+ *
+ * Returns true if and only if there are no active users of the segment and
+ * one of the following is true:
+ *
+ * 1) shmctl(id, IPC_RMID, NULL) was called for this shp
+ *
+ * 2) sysctl kernel.shm_rmid_forced is set to 1.
  */
-static struct lock_class_key hugetlbfs_i_mmap_rwsem_key;
-
-static struct inode *hugetlbfs_get_inode(struct super_block *sb,
-					struct inode *dir,
-					umode_t mode, dev_t dev)
+static bool shm_may_destroy(struct shmid_kernel *shp)
 {
-	struct inode *inode;
-	struct resv_map *resv_map = NULL;
-
-	/*
-	 * Reserve maps are only needed for inodes that can have associated
-	 * page allocations.
-	 */
-	if (S_ISREG(mode) || S_ISLNK(mode)) {
-		resv_map = resv_map_alloc();
-		if (!resv_map)
-			return NULL;
-	}
-
-	inode = new_inode(sb);
-	if (inode) {
-		struct hugetlbfs_inode_info *info = HUGETLBFS_I(inode);
-
-		inode->i_ino = get_next_ino();
-		inode_init_owner(inode, dir, mode);
-		lockdep_set_class(&inode->i_mapping->i_mmap_rwsem,
-				&hugetlbfs_i_mmap_rwsem_key);
-		inode->i_mapping->a_ops = &hugetlbfs_aops;
-		inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
-		inode->i_mapping->private_data = resv_map;
-		info->seals = F_SEAL_SEAL;
-		switch (mode & S_IFMT) {
-		default:
-			init_special_inode(inode, mode, dev);
-			break;
-		case S_IFREG:
-			inode->i_op = &hugetlbfs_inode_operations;
-			inode->i_fop = &hugetlbfs_file_operations;
-			break;
-		case S_IFDIR:
-			inode->i_op = &hugetlbfs_dir_inode_operations;
-			inode->i_fop = &simple_dir_operations;
-
-			/* directory inodes start off with i_nlink == 2 (for "." entry) */
-			inc_nlink(inode);
-			break;
-		case S_IFLNK:
-			inode->i_op = &page_symlink_inode_operations;
-			inode_nohighmem(inode);
-			break;
-		}
-		lockdep_annotate_inode_mutex_key(inode);
-	} else {
-		if (resv_map)
-			kref_put(&resv_map->refs, resv_map_release);
-	}
-
-	return inode;
+	return (shp->shm_nattch == 0) &&
+	       (shp->ns->shm_rmid_forced ||
+		(shp->shm_perm.mode & SHM_DEST));
 }
 
 /*
- * File creation. Allocate an inode, and we're done..
+ * remove the attach descriptor vma.
+ * free memory for segment if it is marked destroyed.
+ * The descriptor has already been removed from the current->mm->mmap list
+ * and will later be kfree()d.
  */
-static int hugetlbfs_mknod(struct inode *dir,
-			struct dentry *dentry, umode_t mode, dev_t dev)
+static void shm_close(struct vm_area_struct *vma)
 {
-	struct inode *inode;
-	int error = -ENOSPC;
+	struct file *file = vma->vm_file;
+	struct shm_file_data *sfd = shm_file_data(file);
+	struct shmid_kernel *shp;
+	struct ipc_namespace *ns = sfd->ns;
 
-	inode = hugetlbfs_get_inode(dir->i_sb, dir, mode, dev);
-	if (inode) {
-		dir->i_ctime = dir->i_mtime = current_time(dir);
-		d_instantiate(dentry, inode);
-		dget(dentry);	/* Extra count - pin the dentry in core */
-		error = 0;
-	}
-	return error;
-}
-
-static int hugetlbfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
-{
-	int retval = hugetlbfs_mknod(dir, dentry, mode | S_IFDIR, 0);
-	if (!retval)
-		inc_nlink(dir);
-	return retval;
-}
-
-static int hugetlbfs_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
-{
-	return hugetlbfs_mknod(dir, dentry, mode | S_IFREG, 0);
-}
-
-static int hugetlbfs_symlink(struct inode *dir,
-			struct dentry *dentry, const char *symname)
-{
-	struct inode *inode;
-	int error = -ENOSPC;
-
-	inode = hugetlbfs_get_inode(dir->i_sb, dir, S_IFLNK|S_IRWXUGO, 0);
-	if (inode) {
-		int l = strlen(symname)+1;
-		error = page_symlink(inode, symname, l);
-		if (!error) {
-			d_instantiate(dentry, inode);
-			dget(dentry);
-		} else
-			iput(inode);
-	}
-	dir->i_ctime = dir->i_mtime = current_time(dir);
-
-	return error;
-}
-
-/*
- * mark the head page dirty
- */
-static int hugetlbfs_set_page_dirty(struct page *page)
-{
-	struct page *head = compound_head(page);
-
-	SetPageDirty(head);
-	return 0;
-}
-
-static int hugetlbfs_migrate_page(struct address_space *mapping,
-				struct page *newpage, struct page *page,
-				enum migrate_mode mode)
-{
-	int rc;
-
-	rc = migrate_huge_page_move_mapping(mapping, newpage, page);
-	if (rc != MIGRATEPAGE_SUCCESS)
-		return rc;
+	down_write(&shm_ids(ns).rwsem);
+	/* remove from the list of attaches of the shm segment */
+	shp = shm_lock(ns, sfd->id);
 
 	/*
-	 * page_private is subpool pointer in hugetlb pages.  Transfer to
-	 * new page.  PagePrivate is not associated with page_private for
-	 * hugetlb pages and can not be set here as only page_huge_active
-	 * pages can be migrated.
+	 * We raced in the idr lookup or with shm_destroy().
+	 * Either way, the ID is busted.
 	 */
-	if (page_private(page)) {
-		set_page_private(newpage, page_private(page));
-		set_page_private(page, 0);
-	}
+	if (WARN_ON_ONCE(IS_ERR(shp)))
+		goto done; /* no-op */
 
-	if (mode != MIGRATE_SYNC_NO_COPY)
-		migrate_page_copy(newpage, page);
+	ipc_update_pid(&shp->shm_lprid, task_tgid(current));
+	shp->shm_dtim = ktime_get_real_seconds();
+	shp->shm_nattch--;
+	if (shm_may_destroy(shp))
+		shm_destroy(ns, shp);
 	else
-		migrate_page_states(newpage, page);
-
-	return MIGRATEPAGE_SUCCESS;
+		shm_unlock(shp);
+done:
+	up_write(&shm_ids(ns).rwsem);
 }
 
-static int hugetlbfs_error_remove_page(struct address_space *mapping,
-				struct page *page)
+/* Called with ns->shm_ids(ns).rwsem locked */
+static int shm_try_destroy_orphaned(int id, void *p, void *data)
 {
-	struct inode *inode = mapping->host;
-	pgoff_t index = page->index;
-
-	remove_huge_page(page);
-	if (unlikely(hugetlb_unreserve_pages(inode, index, index + 1, 1)))
-		hugetlb_fix_reserve_counts(inode);
-
-	return 0;
-}
-
-/*
- * Display the mount options in /proc/mounts.
- */
-static int hugetlbfs_show_options(struct seq_file *m, struct dentry *root)
-{
-	struct hugetlbfs_sb_info *sbinfo = HUGETLBFS_SB(root->d_sb);
-	struct hugepage_subpool *spool = sbinfo->spool;
-	unsigned long hpage_size = huge_page_size(sbinfo->hstate);
-	unsigned hpage_shift = huge_page_shift(sbinfo->hstate);
-	char mod;
-
-	if (!uid_eq(sbinfo->uid, GLOBAL_ROOT_UID))
-		seq_printf(m, ",uid=%u",
-			   from_kuid_munged(&init_user_ns, sbinfo->uid));
-	if (!gid_eq(sbinfo->gid, GLOBAL_ROOT_GID))
-		seq_printf(m, ",gid=%u",
-			   from_kgid_munged(&init_user_ns, sbinfo->gid));
-	if (sbinfo->mode != 0755)
-		seq_printf(m, ",mode=%o", sbinfo->mode);
-	if (sbinfo->max_inodes != -1)
-		seq_printf(m, ",nr_inodes=%lu", sbinfo->max_inodes);
-
-	hpage_size /= 1024;
-	mod = 'K';
-	if (hpage_size >= 1024) {
-		hpage_size /= 1024;
-		mod = 'M';
-	}
-	seq_printf(m, ",pagesize=%lu%c", hpage_size, mod);
-	if (spool) {
-		if (spool->max_hpages != -1)
-			seq_printf(m, ",size=%llu",
-				   (unsigned long long)spool->max_hpages << hpage_shift);
-		if (spool->min_hpages != -1)
-			seq_printf(m, ",min_size=%llu",
-				   (unsigned long long)spool->min_hpages << hpage_shift);
-	}
-	return 0;
-}
-
-static int hugetlbfs_statfs(struct dentry *dentry, struct kstatfs *buf)
-{
-	struct hugetlbfs_sb_info *sbinfo = HUGETLBFS_SB(dentry->d_sb);
-	struct hstate *h = hstate_inode(d_inode(dentry));
-
-	buf->f_type = HUGETLBFS_MAGIC;
-	buf->f_bsize = huge_page_size(h);
-	if (sbinfo) {
-		spin_lock(&sbinfo->stat_lock);
-		/* If no limits set, just report 0 for max/free/used
-		 * blocks, like simple_statfs() */
-		if (sbinfo->spool) {
-			long free_pages;
-
-			spin_lock(&sbinfo->spool->lock);
-			buf->f_blocks = sbinfo->spool->max_hpages;
-			free_pages = sbinfo->spool->max_hpages
-				- sbinfo->spool->used_hpages;
-			buf->f_bavail = buf->f_bfree = free_pages;
-			spin_unlock(&sbinfo->spool->lock);
-			buf->f_files = sbinfo->max_inodes;
-			buf->f_ffree = sbinfo->free_inodes;
-		}
-		spin_unlock(&sbinfo->stat_lock);
-	}
-	buf->f_namelen = NAME_MAX;
-	return 0;
-}
-
-static void hugetlbfs_put_super(struct super_block *sb)
-{
-	struct hugetlbfs_sb_info *sbi = HUGETLBFS_SB(sb);
-
-	if (sbi) {
-		sb->s_fs_info = NULL;
-
-		if (sbi->spool)
-			hugepage_put_subpool(sbi->spool);
-
-		kfree(sbi);
-	}
-}
-
-static inline int hugetlbfs_dec_free_inodes(struct hugetlbfs_sb_info *sbinfo)
-{
-	if (sbinfo->free_inodes >= 0) {
-		spin_lock(&sbinfo->stat_lock);
-		if (unlikely(!sbinfo->free_inodes)) {
-			spin_unlock(&sbinfo->stat_lock);
-			return 0;
-		}
-		sbinfo->free_inodes--;
-		spin_unlock(&sbinfo->stat_lock);
-	}
-
-	return 1;
-}
-
-static void hugetlbfs_inc_free_inodes(struct hugetlbfs_sb_info *sbinfo)
-{
-	if (sbinfo->free_inodes >= 0) {
-		spin_lock(&sbinfo->stat_lock);
-		sbinfo->free_inodes++;
-		spin_unlock(&sbinfo->stat_lock);
-	}
-}
-
-
-static struct kmem_cache *hugetlbfs_inode_cachep;
-
-static struct inode *hugetlbfs_alloc_inode(struct super_block *sb)
-{
-	struct hugetlbfs_sb_info *sbinfo = HUGETLBFS_SB(sb);
-	struct hugetlbfs_inode_info *p;
-
-	if (unlikely(!hugetlbfs_dec_free_inodes(sbinfo)))
-		return NULL;
-	p = kmem_cache_alloc(hugetlbfs_inode_cachep, GFP_KERNEL);
-	if (unlikely(!p)) {
-		hugetlbfs_inc_free_inodes(sbinfo);
-		return NULL;
-	}
+	struct ipc_namespace *ns = data;
+	struct kern_ipc_perm *ipcp = p;
+	struct shmid_kernel *shp = container_of(ipcp, struct shmid_kernel, shm_perm);
 
 	/*
-	 * Any time after allocation, hugetlbfs_destroy_inode can be called
-	 * for the inode.  mpol_free_shared_policy is unconditionally called
-	 * as part of hugetlbfs_destroy_inode.  So, initialize policy here
-	 * in case of a quick call to destroy.
+	 * We want to destroy segments without users and with already
+	 * exit'ed originating process.
 	 *
-	 * Note that the policy is initialized even if we are creating a
-	 * private inode.  This simplifies hugetlbfs_destroy_inode.
+	 * As shp->* are changed under rwsem, it's safe to skip shp locking.
 	 */
-	mpol_shared_policy_init(&p->policy, NULL);
-
-	return &p->vfs_inode;
-}
-
-static void hugetlbfs_i_callback(struct rcu_head *head)
-{
-	struct inode *inode = container_of(head, struct inode, i_rcu);
-	kmem_cache_free(hugetlbfs_inode_cachep, HUGETLBFS_I(inode));
-}
-
-static void hugetlbfs_destroy_inode(struct inode *inode)
-{
-	hugetlbfs_inc_free_inodes(HUGETLBFS_SB(inode->i_sb));
-	mpol_free_shared_policy(&HUGETLBFS_I(inode)->policy);
-	call_rcu(&inode->i_rcu, hugetlbfs_i_callback);
-}
-
-static const struct address_space_operations hugetlbfs_aops = {
-	.write_begin	= hugetlbfs_write_begin,
-	.write_end	= hugetlbfs_write_end,
-	.set_page_dirty	= hugetlbfs_set_page_dirty,
-	.migratepage    = hugetlbfs_migrate_page,
-	.error_remove_page	= hugetlbfs_error_remove_page,
-};
-
-
-static void init_once(void *foo)
-{
-	struct hugetlbfs_inode_info *ei = (struct hugetlbfs_inode_info *)foo;
-
-	inode_init_once(&ei->vfs_inode);
-}
-
-const struct file_operations hugetlbfs_file_operations = {
-	.read_iter		= hugetlbfs_read_iter,
-	.mmap			= hugetlbfs_file_mmap,
-	.fsync			= noop_fsync,
-	.get_unmapped_area	= hugetlb_get_unmapped_area,
-	.llseek			= default_llseek,
-	.fallocate		= hugetlbfs_fallocate,
-};
-
-static const struct inode_operations hugetlbfs_dir_inode_operations = {
-	.create		= hugetlbfs_create,
-	.lookup		= simple_lookup,
-	.link		= simple_link,
-	.unlink		= simple_unlink,
-	.symlink	= hugetlbfs_symlink,
-	.mkdir		= hugetlbfs_mkdir,
-	.rmdir		= simple_rmdir,
-	.mknod		= hugetlbfs_mknod,
-	.rename		= simple_rename,
-	.setattr	= hugetlbfs_setattr,
-};
-
-static const struct inode_operations hugetlbfs_inode_operations = {
-	.setattr	= hugetlbfs_setattr,
-};
-
-static const struct super_operations hugetlbfs_ops = {
-	.alloc_inode    = hugetlbfs_alloc_inode,
-	.destroy_inode  = hugetlbfs_destroy_inode,
-	.evict_inode	= hugetlbfs_evict_inode,
-	.statfs		= hugetlbfs_statfs,
-	.put_super	= hugetlbfs_put_super,
-	.show_options	= hugetlbfs_show_options,
-};
-
-enum hugetlbfs_size_type { NO_SIZE, SIZE_STD, SIZE_PERCENT };
-
-/*
- * Convert size option passed from command line to number of huge pages
- * in the pool specified by hstate.  Size option could be in bytes
- * (val_type == SIZE_STD) or percentage of the pool (val_type == SIZE_PERCENT).
- */
-static long
-hugetlbfs_size_to_hpages(struct hstate *h, unsigned long long size_opt,
-			 enum hugetlbfs_size_type val_type)
-{
-	if (val_type == NO_SIZE)
-		return -1;
-
-	if (val_type == SIZE_PERCENT) {
-		size_opt <<= huge_page_shift(h);
-		size_opt *= h->max_huge_pages;
-		do_div(size_opt, 100);
-	}
-
-	size_opt >>= huge_page_shift(h);
-	return size_opt;
-}
-
-static int
-hugetlbfs_parse_options(char *options, struct hugetlbfs_config *pconfig)
-{
-	char *p, *rest;
-	substring_t args[MAX_OPT_ARGS];
-	int option;
-	unsigned long long max_size_opt = 0, min_size_opt = 0;
-	enum hugetlbfs_size_type max_val_type = NO_SIZE, min_val_type = NO_SIZE;
-
-	if (!options)
+	if (!list_empty(&shp->shm_clist))
 		return 0;
 
-	while ((p = strsep(&options, ",")) != NULL) {
-		int token;
-		if (!*p)
-			continue;
-
-		token = match_token(p, tokens, args);
-		switch (token) {
-		case Opt_uid:
-			if (match_int(&args[0], &option))
- 				goto bad_val;
-			pconfig->uid = make_kuid(current_user_ns(), option);
-			if (!uid_valid(pconfig->uid))
-				goto bad_val;
-			break;
-
-		case Opt_gid:
-			if (match_int(&args[0], &option))
- 				goto bad_val;
-			pconfig->gid = make_kgid(current_user_ns(), option);
-			if (!gid_valid(pconfig->gid))
-				goto bad_val;
-			break;
-
-		case Opt_mode:
-			if (match_octal(&args[0], &option))
- 				goto bad_val;
-			pconfig->mode = option & 01777U;
-			break;
-
-		case Opt_size: {
-			/* memparse() will accept a K/M/G without a digit */
-			if (!isdigit(*args[0].from))
-				goto bad_val;
-			max_size_opt = memparse(args[0].from, &rest);
-			max_val_type = SIZE_STD;
-			if (*rest == '%')
-				max_val_type = SIZE_PERCENT;
-			break;
-		}
-
-		case Opt_nr_inodes:
-			/* memparse() will accept a K/M/G without a digit */
-			if (!isdigit(*args[0].from))
-				goto bad_val;
-			pconfig->nr_inodes = memparse(args[0].from, &rest);
-			break;
-
-		case Opt_pagesize: {
-			unsigned long ps;
-			ps = memparse(args[0].from, &rest);
-			pconfig->hstate = size_to_hstate(ps);
-			if (!pconfig->hstate) {
-				pr_err("Unsupported page size %lu MB\n",
-					ps >> 20);
-				return -EINVAL;
-			}
-			break;
-		}
-
-		case Opt_min_size: {
-			/* memparse() will accept a K/M/G without a digit */
-			if (!isdigit(*args[0].from))
-				goto bad_val;
-			min_size_opt = memparse(args[0].from, &rest);
-			min_val_type = SIZE_STD;
-			if (*rest == '%')
-				min_val_type = SIZE_PERCENT;
-			break;
-		}
-
-		default:
-			pr_err("Bad mount option: \"%s\"\n", p);
-			return -EINVAL;
-			break;
-		}
+	if (shm_may_destroy(shp)) {
+		shm_lock_by_ptr(shp);
+		shm_destroy(ns, shp);
 	}
-
-	/*
-	 * Use huge page pool size (in hstate) to convert the size
-	 * options to number of huge pages.  If NO_SIZE, -1 is returned.
-	 */
-	pconfig->max_hpages = hugetlbfs_size_to_hpages(pconfig->hstate,
-						max_size_opt, max_val_type);
-	pconfig->min_hpages = hugetlbfs_size_to_hpages(pconfig->hstate,
-						min_size_opt, min_val_type);
-
-	/*
-	 * If max_size was specified, then min_size must be smaller
-	 */
-	if (max_val_type > NO_SIZE &&
-	    pconfig->min_hpages > pconfig->max_hpages) {
-		pr_err("minimum size can not be greater than maximum size\n");
-		return -EINVAL;
-	}
-
 	return 0;
-
-bad_val:
-	pr_err("Bad value '%s' for mount option '%s'\n", args[0].from, p);
- 	return -EINVAL;
 }
 
-static int
-hugetlbfs_fill_super(struct super_block *sb, void *data, int silent)
+void shm_destroy_orphaned(struct ipc_namespace *ns)
 {
-	int ret;
-	struct hugetlbfs_config config;
-	struct hugetlbfs_sb_info *sbinfo;
+	down_write(&shm_ids(ns).rwsem);
+	if (shm_ids(ns).in_use)
+		idr_for_each(&shm_ids(ns).ipcs_idr, &shm_try_destroy_orphaned, ns);
+	up_write(&shm_ids(ns).rwsem);
+}
 
-	config.max_hpages = -1; /* No limit on size by default */
-	config.nr_inodes = -1; /* No limit on number of inodes by default */
-	config.uid = current_fsuid();
-	config.gid = current_fsgid();
-	config.mode = 0755;
-	config.hstate = &default_hstate;
-	config.min_hpages = -1; /* No default minimum size */
-	ret = hugetlbfs_parse_options(data, &config);
+/* Locking assumes this will only be called with task == current */
+void exit_shm(struct task_struct *task)
+{
+	for (;;) {
+		struct shmid_kernel *shp;
+		struct ipc_namespace *ns;
+
+		task_lock(task);
+
+		if (list_empty(&task->sysvshm.shm_clist)) {
+			task_unlock(task);
+			break;
+		}
+
+		shp = list_first_entry(&task->sysvshm.shm_clist, struct shmid_kernel,
+				shm_clist);
+
+		/*
+		 * 1) Get pointer to the ipc namespace. It is worth to say
+		 * that this pointer is guaranteed to be valid because
+		 * shp lifetime is always shorter than namespace lifetime
+		 * in which shp lives.
+		 * We taken task_lock it means that shp won't be freed.
+		 */
+		ns = shp->ns;
+
+		/*
+		 * 2) If kernel.shm_rmid_forced is not set then only keep track of
+		 * which shmids are orphaned, so that a later set of the sysctl
+		 * can clean them up.
+		 */
+		if (!ns->shm_rmid_forced)
+			goto unlink_continue;
+
+		/*
+		 * 3) get a reference to the namespace.
+		 *    The refcount could be already 0. If it is 0, then
+		 *    the shm objects will be free by free_ipc_work().
+		 */
+		ns = get_ipc_ns_not_zero(ns);
+		if (!ns) {
+unlink_continue:
+			list_del_init(&shp->shm_clist);
+			task_unlock(task);
+			continue;
+		}
+
+		/*
+		 * 4) get a reference to shp.
+		 *   This cannot fail: shm_clist_rm() is called before
+		 *   ipc_rmid(), thus the refcount cannot be 0.
+		 */
+		WARN_ON(!ipc_rcu_getref(&shp->shm_perm));
+
+		/*
+		 * 5) unlink the shm segment from the list of segments
+		 *    created by current.
+		 *    This must be done last. After unlinking,
+		 *    only the refcounts obtained above prevent IPC_RMID
+		 *    from destroying the segment or the namespace.
+		 */
+		list_del_init(&shp->shm_clist);
+
+		task_unlock(task);
+
+		/*
+		 * 6) we have all references
+		 *    Thus lock & if needed destroy shp.
+		 */
+		down_write(&shm_ids(ns).rwsem);
+		shm_lock_by_ptr(shp);
+		/*
+		 * rcu_read_lock was implicitly taken in shm_lock_by_ptr, it's
+		 * safe to call ipc_rcu_putref here
+		 */
+		ipc_rcu_putref(&shp->shm_perm, shm_rcu_free);
+
+		if (ipc_valid_object(&shp->shm_perm)) {
+			if (shm_may_destroy(shp))
+				shm_destroy(ns, shp);
+			else
+				shm_unlock(shp);
+		} else {
+			/*
+			 * Someone else deleted the shp from namespace
+			 * idr/kht while we have waited.
+			 * Just unlock and continue.
+			 */
+			shm_unlock(shp);
+		}
+
+		up_write(&shm_ids(ns).rwsem);
+		put_ipc_ns(ns); /* paired with get_ipc_ns_not_zero */
+	}
+}
+
+static vm_fault_t shm_fault(struct vm_fault *vmf)
+{
+	struct file *file = vmf->vma->vm_file;
+	struct shm_file_data *sfd = shm_file_data(file);
+
+	return sfd->vm_ops->fault(vmf);
+}
+
+static int shm_split(struct vm_area_struct *vma, unsigned long addr)
+{
+	struct file *file = vma->vm_file;
+	struct shm_file_data *sfd = shm_file_data(file);
+
+	if (sfd->vm_ops->split)
+		return sfd->vm_ops->split(vma, addr);
+
+	return 0;
+}
+
+static unsigned long shm_pagesize(struct vm_area_struct *vma)
+{
+	struct file *file = vma->vm_file;
+	struct shm_file_data *sfd = shm_file_data(file);
+
+	if (sfd->vm_ops->pagesize)
+		return sfd->vm_ops->pagesize(vma);
+
+	return PAGE_SIZE;
+}
+
+#ifdef CONFIG_NUMA
+static int shm_set_policy(struct vm_area_struct *vma, struct mempolicy *new)
+{
+	struct file *file = vma->vm_file;
+	struct shm_file_data *sfd = shm_file_data(file);
+	int err = 0;
+
+	if (sfd->vm_ops->set_policy)
+		err = sfd->vm_ops->set_policy(vma, new);
+	return err;
+}
+
+static struct mempolicy *shm_get_policy(struct vm_area_struct *vma,
+					unsigned long addr)
+{
+	struct file *file = vma->vm_file;
+	struct shm_file_data *sfd = shm_file_data(file);
+	struct mempolicy *pol = NULL;
+
+	if (sfd->vm_ops->get_policy)
+		pol = sfd->vm_ops->get_policy(vma, addr);
+	else if (vma->vm_policy)
+		pol = vma->vm_policy;
+
+	return pol;
+}
+#endif
+
+static int shm_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct shm_file_data *sfd = shm_file_data(file);
+	int ret;
+
+	/*
+	 * In case of remap_file_pages() emulation, the file can represent an
+	 * IPC ID that was removed, and possibly even reused by another shm
+	 * segment already.  Propagate this case as an error to caller.
+	 */
+	ret = __shm_open(vma);
 	if (ret)
 		return ret;
 
-	sbinfo = kmalloc(sizeof(struct hugetlbfs_sb_info), GFP_KERNEL);
-	if (!sbinfo)
-		return -ENOMEM;
-	sb->s_fs_info = sbinfo;
-	sbinfo->hstate = config.hstate;
-	spin_lock_init(&sbinfo->stat_lock);
-	sbinfo->max_inodes = config.nr_inodes;
-	sbinfo->free_inodes = config.nr_inodes;
-	sbinfo->spool = NULL;
-	sbinfo->uid = config.uid;
-	sbinfo->gid = config.gid;
-	sbinfo->mode = config.mode;
-
-	/*
-	 * Allocate and initialize subpool if maximum or minimum size is
-	 * specified.  Any needed reservations (for minimim size) are taken
-	 * taken when the subpool is created.
-	 */
-	if (config.max_hpages != -1 || config.min_hpages != -1) {
-		sbinfo->spool = hugepage_new_subpool(config.hstate,
-							config.max_hpages,
-							config.min_hpages);
-		if (!sbinfo->spool)
-			goto out_free;
+	ret = call_mmap(sfd->file, vma);
+	if (ret) {
+		shm_close(vma);
+		return ret;
 	}
-	sb->s_maxbytes = MAX_LFS_FILESIZE;
-	sb->s_blocksize = huge_page_size(config.hstate);
-	sb->s_blocksize_bits = huge_page_shift(config.hstate);
-	sb->s_magic = HUGETLBFS_MAGIC;
-	sb->s_op = &hugetlbfs_ops;
-	sb->s_time_gran = 1;
-	sb->s_root = d_make_root(hugetlbfs_get_root(sb, &config));
-	if (!sb->s_root)
-		goto out_free;
+	sfd->vm_ops = vma->vm_ops;
+#ifdef CONFIG_MMU
+	WARN_ON(!sfd->vm_ops->fault);
+#endif
+	vma->vm_ops = &shm_vm_ops;
 	return 0;
-out_free:
-	kfree(sbinfo->spool);
-	kfree(sbinfo);
-	return -ENOMEM;
 }
 
-static struct dentry *hugetlbfs_mount(struct file_system_type *fs_type,
-	int flags, const char *dev_name, void *data)
+static int shm_release(struct inode *ino, struct file *file)
 {
-	return mount_nodev(fs_type, flags, data, hugetlbfs_fill_super);
+	struct shm_file_data *sfd = shm_file_data(file);
+
+	put_ipc_ns(sfd->ns);
+	fput(sfd->file);
+	shm_file_data(file) = NULL;
+	kfree(sfd);
+	return 0;
 }
 
-static struct file_system_type hugetlbfs_fs_type = {
-	.name		= "hugetlbfs",
-	.mount		= hugetlbfs_mount,
-	.kill_sb	= kill_litter_super,
+static int shm_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	struct shm_file_data *sfd = shm_file_data(file);
+
+	if (!sfd->file->f_op->fsync)
+		return -EINVAL;
+	return sfd->file->f_op->fsync(sfd->file, start, end, datasync);
+}
+
+static long shm_fallocate(struct file *file, int mode, loff_t offset,
+			  loff_t len)
+{
+	struct shm_file_data *sfd = shm_file_data(file);
+
+	if (!sfd->file->f_op->fallocate)
+		return -EOPNOTSUPP;
+	return sfd->file->f_op->fallocate(file, mode, offset, len);
+}
+
+static unsigned long shm_get_unmapped_area(struct file *file,
+	unsigned long addr, unsigned long len, unsigned long pgoff,
+	unsigned long flags)
+{
+	struct shm_file_data *sfd = shm_file_data(file);
+
+	return sfd->file->f_op->get_unmapped_area(sfd->file, addr, len,
+						pgoff, flags);
+}
+
+static const struct file_operations shm_file_operations = {
+	.mmap		= shm_mmap,
+	.fsync		= shm_fsync,
+	.release	= shm_release,
+	.get_unmapped_area	= shm_get_unmapped_area,
+	.llseek		= noop_llseek,
+	.fallocate	= shm_fallocate,
 };
 
-static struct vfsmount *hugetlbfs_vfsmount[HUGE_MAX_HSTATE];
+/*
+ * shm_file_operations_huge is now identical to shm_file_operations,
+ * but we keep it distinct for the sake of is_file_shm_hugepages().
+ */
+static const struct file_operations shm_file_operations_huge = {
+	.mmap		= shm_mmap,
+	.fsync		= shm_fsync,
+	.release	= shm_release,
+	.get_unmapped_area	= shm_get_unmapped_area,
+	.llseek		= noop_llseek,
+	.fallocate	= shm_fallocate,
+};
 
-static int can_do_hugetlb_shm(void)
+bool is_file_shm_hugepages(struct file *file)
 {
-	kgid_t shm_group;
-	shm_group = make_kgid(&init_user_ns, sysctl_hugetlb_shm_group);
-	return capable(CAP_IPC_LOCK) || in_group_p(shm_group);
+	return file->f_op == &shm_file_operations_huge;
 }
 
-static int get_hstate_idx(int page_size_log)
-{
-	struct hstate *h = hstate_sizelog(page_size_log);
+static const struct vm_operations_struct shm_vm_ops = {
+	.open	= shm_open,	/* callback for a new vm-area open */
+	.close	= shm_close,	/* callback for when the vm-area is released */
+	.fault	= shm_fault,
+	.split	= shm_split,
+	.pagesize = shm_pagesize,
+#if defined(CONFIG_NUMA)
+	.set_policy = shm_set_policy,
+	.get_policy = shm_get_policy,
+#endif
+};
 
-	if (!h)
-		return -1;
-	return h - hstates;
+/**
+ * newseg - Create a new shared memory segment
+ * @ns: namespace
+ * @params: ptr to the structure that contains key, size and shmflg
+ *
+ * Called with shm_ids.rwsem held as a writer.
+ */
+static int newseg(struct ipc_namespace *ns, struct ipc_params *params)
+{
+	key_t key = params->key;
+	int shmflg = params->flg;
+	size_t size = params->u.size;
+	int error;
+	struct shmid_kernel *shp;
+	size_t numpages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	struct file *file;
+	char name[13];
+	vm_flags_t acctflag = 0;
+
+	if (size < SHMMIN || size > ns->shm_ctlmax)
+		return -EINVAL;
+
+	if (numpages << PAGE_SHIFT < size)
+		return -ENOSPC;
+
+	if (ns->shm_tot + numpages < ns->shm_tot ||
+			ns->shm_tot + numpages > ns->shm_ctlall)
+		return -ENOSPC;
+
+	shp = kvmalloc(sizeof(*shp), GFP_KERNEL);
+	if (unlikely(!shp))
+		return -ENOMEM;
+
+	shp->shm_perm.key = key;
+	shp->shm_perm.mode = (shmflg & S_IRWXUGO);
+	shp->mlock_user = NULL;
+
+	shp->shm_perm.security = NULL;
+	error = security_shm_alloc(&shp->shm_perm);
+	if (error) {
+		kvfree(shp);
+		return error;
+	}
+
+	sprintf(name, "SYSV%08x", key);
+	if (shmflg & SHM_HUGETLB) {
+		struct hstate *hs;
+		size_t hugesize;
+
+		hs = hstate_sizelog((shmflg >> SHM_HUGE_SHIFT) & SHM_HUGE_MASK);
+		if (!hs) {
+			error = -EINVAL;
+			goto no_file;
+		}
+		hugesize = ALIGN(size, huge_page_size(hs));
+
+		/* hugetlb_file_setup applies strict accounting */
+		if (shmflg & SHM_NORESERVE)
+			acctflag = VM_NORESERVE;
+		file = hugetlb_file_setup(name, hugesize, acctflag,
+				  &shp->mlock_user, HUGETLB_SHMFS_INODE,
+				(shmflg >> SHM_HUGE_SHIFT) & SHM_HUGE_MASK);
+	} else {
+		/*
+		 * Do not allow no accounting for OVERCOMMIT_NEVER, even
+		 * if it's asked for.
+		 */
+		if  ((shmflg & SHM_NORESERVE) &&
+				sysctl_overcommit_memory != OVERCOMMIT_NEVER)
+			acctflag = VM_NORESERVE;
+		file = shmem_kernel_file_setup(name, size, acctflag);
+	}
+	error = PTR_ERR(file);
+	if (IS_ERR(file))
+		goto no_file;
+
+	shp->shm_cprid = get_pid(task_tgid(current));
+	shp->shm_lprid = NULL;
+	shp->shm_atim = shp->shm_dtim = 0;
+	shp->shm_ctim = ktime_get_real_seconds();
+	shp->shm_segsz = size;
+	shp->shm_nattch = 0;
+	shp->shm_file = file;
+	shp->shm_creator = current;
+
+	/* ipc_addid() locks shp upon success. */
+	error = ipc_addid(&shm_ids(ns), &shp->shm_perm, ns->shm_ctlmni);
+	if (error < 0)
+		goto no_id;
+
+	shp->ns = ns;
+
+	task_lock(current);
+	list_add(&shp->shm_clist, &current->sysvshm.shm_clist);
+	task_unlock(current);
+
+	/*
+	 * shmid gets reported as "inode#" in /proc/pid/maps.
+	 * proc-ps tools use this. Changing this will break them.
+	 */
+	file_inode(file)->i_ino = shp->shm_perm.id;
+
+	ns->shm_tot += numpages;
+	error = shp->shm_perm.id;
+
+	ipc_unlock_object(&shp->shm_perm);
+	rcu_read_unlock();
+	return error;
+
+no_id:
+	ipc_update_pid(&shp->shm_cprid, NULL);
+	ipc_update_pid(&shp->shm_lprid, NULL);
+	if (is_file_hugepages(file) && shp->mlock_user)
+		user_shm_unlock(size, shp->mlock_user);
+	fput(file);
+	ipc_rcu_putref(&shp->shm_perm, shm_rcu_free);
+	return error;
+no_file:
+	call_rcu(&shp->shm_perm.rcu, shm_rcu_free);
+	return error;
 }
 
 /*
- * Note that size should be aligned to proper hugepage size in caller side,
- * otherwise hugetlb_reserve_pages reserves one less hugepages than intended.
+ * Called with shm_ids.rwsem and ipcp locked.
  */
-struct file *hugetlb_file_setup(const char *name, size_t size,
-				vm_flags_t acctflag, struct user_struct **user,
-				int creat_flags, int page_size_log)
+static inline int shm_more_checks(struct kern_ipc_perm *ipcp,
+				struct ipc_params *params)
+{
+	struct shmid_kernel *shp;
+
+	shp = container_of(ipcp, struct shmid_kernel, shm_perm);
+	if (shp->shm_segsz < params->u.size)
+		return -EINVAL;
+
+	return 0;
+}
+
+long ksys_shmget(key_t key, size_t size, int shmflg)
+{
+	struct ipc_namespace *ns;
+	static const struct ipc_ops shm_ops = {
+		.getnew = newseg,
+		.associate = security_shm_associate,
+		.more_checks = shm_more_checks,
+	};
+	struct ipc_params shm_params;
+
+	ns = current->nsproxy->ipc_ns;
+
+	shm_params.key = key;
+	shm_params.flg = shmflg;
+	shm_params.u.size = size;
+
+	return ipcget(ns, &shm_ids(ns), &shm_ops, &shm_params);
+}
+
+SYSCALL_DEFINE3(shmget, key_t, key, size_t, size, int, shmflg)
+{
+	return ksys_shmget(key, size, shmflg);
+}
+
+static inline unsigned long copy_shmid_to_user(void __user *buf, struct shmid64_ds *in, int version)
+{
+	switch (version) {
+	case IPC_64:
+		return copy_to_user(buf, in, sizeof(*in));
+	case IPC_OLD:
+	    {
+		struct shmid_ds out;
+
+		memset(&out, 0, sizeof(out));
+		ipc64_perm_to_ipc_perm(&in->shm_perm, &out.shm_perm);
+		out.shm_segsz	= in->shm_segsz;
+		out.shm_atime	= in->shm_atime;
+		out.shm_dtime	= in->shm_dtime;
+		out.shm_ctime	= in->shm_ctime;
+		out.shm_cpid	= in->shm_cpid;
+		out.shm_lpid	= in->shm_lpid;
+		out.shm_nattch	= in->shm_nattch;
+
+		return copy_to_user(buf, &out, sizeof(out));
+	    }
+	default:
+		return -EINVAL;
+	}
+}
+
+static inline unsigned long
+copy_shmid_from_user(struct shmid64_ds *out, void __user *buf, int version)
+{
+	switch (version) {
+	case IPC_64:
+		if (copy_from_user(out, buf, sizeof(*out)))
+			return -EFAULT;
+		return 0;
+	case IPC_OLD:
+	    {
+		struct shmid_ds tbuf_old;
+
+		if (copy_from_user(&tbuf_old, buf, sizeof(tbuf_old)))
+			return -EFAULT;
+
+		out->shm_perm.uid	= tbuf_old.shm_perm.uid;
+		out->shm_perm.gid	= tbuf_old.shm_perm.gid;
+		out->shm_perm.mode	= tbuf_old.shm_perm.mode;
+
+		return 0;
+	    }
+	default:
+		return -EINVAL;
+	}
+}
+
+static inline unsigned long copy_shminfo_to_user(void __user *buf, struct shminfo64 *in, int version)
+{
+	switch (version) {
+	case IPC_64:
+		return copy_to_user(buf, in, sizeof(*in));
+	case IPC_OLD:
+	    {
+		struct shminfo out;
+
+		if (in->shmmax > INT_MAX)
+			out.shmmax = INT_MAX;
+		else
+			out.shmmax = (int)in->shmmax;
+
+		out.shmmin	= in->shmmin;
+		out.shmmni	= in->shmmni;
+		out.shmseg	= in->shmseg;
+		out.shmall	= in->shmall;
+
+		return copy_to_user(buf, &out, sizeof(out));
+	    }
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * Calculate and add used RSS and swap pages of a shm.
+ * Called with shm_ids.rwsem held as a reader
+ */
+static void shm_add_rss_swap(struct shmid_kernel *shp,
+	unsigned long *rss_add, unsigned long *swp_add)
 {
 	struct inode *inode;
-	struct vfsmount *mnt;
-	int hstate_idx;
-	struct file *file;
 
-	hstate_idx = get_hstate_idx(page_size_log);
-	if (hstate_idx < 0)
-		return ERR_PTR(-ENODEV);
+	inode = file_inode(shp->shm_file);
 
-	*user = NULL;
-	mnt = hugetlbfs_vfsmount[hstate_idx];
-	if (!mnt)
-		return ERR_PTR(-ENOENT);
+	if (is_file_hugepages(shp->shm_file)) {
+		struct address_space *mapping = inode->i_mapping;
+		struct hstate *h = hstate_file(shp->shm_file);
+		*rss_add += pages_per_huge_page(h) * mapping->nrpages;
+	} else {
+#ifdef CONFIG_SHMEM
+		struct shmem_inode_info *info = SHMEM_I(inode);
 
-	if (creat_flags == HUGETLB_SHMFS_INODE && !can_do_hugetlb_shm()) {
-		*user = current_user();
-		if (user_shm_lock(size, *user)) {
-			task_lock(current);
-			pr_warn_once("%s (%d): Using mlock ulimits for SHM_HUGETLB is deprecated\n",
-				current->comm, current->pid);
-			task_unlock(current);
-		} else {
-			*user = NULL;
-			return ERR_PTR(-EPERM);
-		}
+		spin_lock_irq(&info->lock);
+		*rss_add += inode->i_mapping->nrpages;
+		*swp_add += info->swapped;
+		spin_unlock_irq(&info->lock);
+#else
+		*rss_add += inode->i_mapping->nrpages;
+#endif
 	}
-
-	file = ERR_PTR(-ENOSPC);
-	inode = hugetlbfs_get_inode(mnt->mnt_sb, NULL, S_IFREG | S_IRWXUGO, 0);
-	if (!inode)
-		goto out;
-	if (creat_flags == HUGETLB_SHMFS_INODE)
-		inode->i_flags |= S_PRIVATE;
-
-	inode->i_size = size;
-	clear_nlink(inode);
-
-	if (hugetlb_reserve_pages(inode, 0,
-			size >> huge_page_shift(hstate_inode(inode)), NULL,
-			acctflag))
-		file = ERR_PTR(-ENOMEM);
-	else
-		file = alloc_file_pseudo(inode, mnt, name, O_RDWR,
-					&hugetlbfs_file_operations);
-	if (!IS_ERR(file))
-		return file;
-
-	iput(inode);
-out:
-	if (*user) {
-		user_shm_unlock(size, *user);
-		*user = NULL;
-	}
-	return file;
 }
 
-static int __init init_hugetlbfs_fs(void)
+/*
+ * Called with shm_ids.rwsem held as a reader
+ */
+static void shm_get_stat(struct ipc_namespace *ns, unsigned long *rss,
+		unsigned long *swp)
 {
-	struct hstate *h;
-	int error;
-	int i;
+	int next_id;
+	int total, in_use;
 
-	if (!hugepages_supported()) {
-		pr_info("disabling because there are no supported hugepage sizes\n");
-		return -ENOTSUPP;
+	*rss = 0;
+	*swp = 0;
+
+	in_use = shm_ids(ns).in_use;
+
+	for (total = 0, next_id = 0; total < in_use; next_id++) {
+		struct kern_ipc_perm *ipc;
+		struct shmid_kernel *shp;
+
+		ipc = idr_find(&shm_ids(ns).ipcs_idr, next_id);
+		if (ipc == NULL)
+			continue;
+		shp = container_of(ipc, struct shmid_kernel, shm_perm);
+
+		shm_add_rss_swap(shp, rss, swp);
+
+		total++;
+	}
+}
+
+/*
+ * This function handles some shmctl commands which require the rwsem
+ * to be held in write mode.
+ * NOTE: no locks must be held, the rwsem is taken inside this function.
+ */
+static int shmctl_down(struct ipc_namespace *ns, int shmid, int cmd,
+		       struct shmid64_ds *shmid64)
+{
+	struct kern_ipc_perm *ipcp;
+	struct shmid_kernel *shp;
+	int err;
+
+	down_write(&shm_ids(ns).rwsem);
+	rcu_read_lock();
+
+	ipcp = ipcctl_obtain_check(ns, &shm_ids(ns), shmid, cmd,
+				      &shmid64->shm_perm, 0);
+	if (IS_ERR(ipcp)) {
+		err = PTR_ERR(ipcp);
+		goto out_unlock1;
 	}
 
-	error = -ENOMEM;
-	hugetlbfs_inode_cachep = kmem_cache_create("hugetlbfs_inode_cache",
-					sizeof(struct hugetlbfs_inode_info),
-					0, SLAB_ACCOUNT, init_once);
-	if (hugetlbfs_inode_cachep == NULL)
-		goto out2;
+	shp = container_of(ipcp, struct shmid_kernel, shm_perm);
 
-	error = register_filesystem(&hugetlbfs_fs_type);
-	if (error)
+	err = security_shm_shmctl(&shp->shm_perm, cmd);
+	if (err)
+		goto out_unlock1;
+
+	switch (cmd) {
+	case IPC_RMID:
+		ipc_lock_object(&shp->shm_perm);
+		/* do_shm_rmid unlocks the ipc object and rcu */
+		do_shm_rmid(ns, ipcp);
+		goto out_up;
+	case IPC_SET:
+		ipc_lock_object(&shp->shm_perm);
+		err = ipc_update_perm(&shmid64->shm_perm, ipcp);
+		if (err)
+			goto out_unlock0;
+		shp->shm_ctim = ktime_get_real_seconds();
+		break;
+	default:
+		err = -EINVAL;
+		goto out_unlock1;
+	}
+
+out_unlock0:
+	ipc_unlock_object(&shp->shm_perm);
+out_unlock1:
+	rcu_read_unlock();
+out_up:
+	up_write(&shm_ids(ns).rwsem);
+	return err;
+}
+
+static int shmctl_ipc_info(struct ipc_namespace *ns,
+			   struct shminfo64 *shminfo)
+{
+	int err = security_shm_shmctl(NULL, IPC_INFO);
+	if (!err) {
+		memset(shminfo, 0, sizeof(*shminfo));
+		shminfo->shmmni = shminfo->shmseg = ns->shm_ctlmni;
+		shminfo->shmmax = ns->shm_ctlmax;
+		shminfo->shmall = ns->shm_ctlall;
+		shminfo->shmmin = SHMMIN;
+		down_read(&shm_ids(ns).rwsem);
+		err = ipc_get_maxidx(&shm_ids(ns));
+		up_read(&shm_ids(ns).rwsem);
+		if (err < 0)
+			err = 0;
+	}
+	return err;
+}
+
+static int shmctl_shm_info(struct ipc_namespace *ns,
+			   struct shm_info *shm_info)
+{
+	int err = security_shm_shmctl(NULL, SHM_INFO);
+	if (!err) {
+		memset(shm_info, 0, sizeof(*shm_info));
+		down_read(&shm_ids(ns).rwsem);
+		shm_info->used_ids = shm_ids(ns).in_use;
+		shm_get_stat(ns, &shm_info->shm_rss, &shm_info->shm_swp);
+		shm_info->shm_tot = ns->shm_tot;
+		shm_info->swap_attempts = 0;
+		shm_info->swap_successes = 0;
+		err = ipc_get_maxidx(&shm_ids(ns));
+		up_read(&shm_ids(ns).rwsem);
+		if (err < 0)
+			err = 0;
+	}
+	return err;
+}
+
+static int shmctl_stat(struct ipc_namespace *ns, int shmid,
+			int cmd, struct shmid64_ds *tbuf)
+{
+	struct shmid_kernel *shp;
+	int err;
+
+	memset(tbuf, 0, sizeof(*tbuf));
+
+	rcu_read_lock();
+	if (cmd == SHM_STAT || cmd == SHM_STAT_ANY) {
+		shp = shm_obtain_object(ns, shmid);
+		if (IS_ERR(shp)) {
+			err = PTR_ERR(shp);
+			goto out_unlock;
+		}
+	} else { /* IPC_STAT */
+		shp = shm_obtain_object_check(ns, shmid);
+		if (IS_ERR(shp)) {
+			err = PTR_ERR(shp);
+			goto out_unlock;
+		}
+	}
+
+	/*
+	 * Semantically SHM_STAT_ANY ought to be identical to
+	 * that functionality provided by the /proc/sysvipc/
+	 * interface. As such, only audit these calls and
+	 * do not do traditional S_IRUGO permission checks on
+	 * the ipc object.
+	 */
+	if (cmd == SHM_STAT_ANY)
+		audit_ipc_obj(&shp->shm_perm);
+	else {
+		err = -EACCES;
+		if (ipcperms(ns, &shp->shm_perm, S_IRUGO))
+			goto out_unlock;
+	}
+
+	err = security_shm_shmctl(&shp->shm_perm, cmd);
+	if (err)
+		goto out_unlock;
+
+	ipc_lock_object(&shp->shm_perm);
+
+	if (!ipc_valid_object(&shp->shm_perm)) {
+		ipc_unlock_object(&shp->shm_perm);
+		err = -EIDRM;
+		goto out_unlock;
+	}
+
+	kernel_to_ipc64_perm(&shp->shm_perm, &tbuf->shm_perm);
+	tbuf->shm_segsz	= shp->shm_segsz;
+	tbuf->shm_atime	= shp->shm_atim;
+	tbuf->shm_dtime	= shp->shm_dtim;
+	tbuf->shm_ctime	= shp->shm_ctim;
+#ifndef CONFIG_64BIT
+	tbuf->shm_atime_high = shp->shm_atim >> 32;
+	tbuf->shm_dtime_high = shp->shm_dtim >> 32;
+	tbuf->shm_ctime_high = shp->shm_ctim >> 32;
+#endif
+	tbuf->shm_cpid	= pid_vnr(shp->shm_cprid);
+	tbuf->shm_lpid	= pid_vnr(shp->shm_lprid);
+	tbuf->shm_nattch = shp->shm_nattch;
+
+	if (cmd == IPC_STAT) {
+		/*
+		 * As defined in SUS:
+		 * Return 0 on success
+		 */
+		err = 0;
+	} else {
+		/*
+		 * SHM_STAT and SHM_STAT_ANY (both Linux specific)
+		 * Return the full id, including the sequence number
+		 */
+		err = shp->shm_perm.id;
+	}
+
+	ipc_unlock_object(&shp->shm_perm);
+out_unlock:
+	rcu_read_unlock();
+	return err;
+}
+
+static int shmctl_do_lock(struct ipc_namespace *ns, int shmid, int cmd)
+{
+	struct shmid_kernel *shp;
+	struct file *shm_file;
+	int err;
+
+	rcu_read_lock();
+	shp = shm_obtain_object_check(ns, shmid);
+	if (IS_ERR(shp)) {
+		err = PTR_ERR(shp);
+		goto out_unlock1;
+	}
+
+	audit_ipc_obj(&(shp->shm_perm));
+	err = security_shm_shmctl(&shp->shm_perm, cmd);
+	if (err)
+		goto out_unlock1;
+
+	ipc_lock_object(&shp->shm_perm);
+
+	/* check if shm_destroy() is tearing down shp */
+	if (!ipc_valid_object(&shp->shm_perm)) {
+		err = -EIDRM;
+		goto out_unlock0;
+	}
+
+	if (!ns_capable(ns->user_ns, CAP_IPC_LOCK)) {
+		kuid_t euid = current_euid();
+
+		if (!uid_eq(euid, shp->shm_perm.uid) &&
+		    !uid_eq(euid, shp->shm_perm.cuid)) {
+			err = -EPERM;
+			goto out_unlock0;
+		}
+		if (cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK)) {
+			err = -EPERM;
+			goto out_unlock0;
+		}
+	}
+
+	shm_file = shp->shm_file;
+	if (is_file_hugepages(shm_file))
+		goto out_unlock0;
+
+	if (cmd == SHM_LOCK) {
+		struct user_struct *user = current_user();
+
+		err = shmem_lock(shm_file, 1, user);
+		if (!err && !(shp->shm_perm.mode & SHM_LOCKED)) {
+			shp->shm_perm.mode |= SHM_LOCKED;
+			shp->mlock_user = user;
+		}
+		goto out_unlock0;
+	}
+
+	/* SHM_UNLOCK */
+	if (!(shp->shm_perm.mode & SHM_LOCKED))
+		goto out_unlock0;
+	shmem_lock(shm_file, 0, shp->mlock_user);
+	shp->shm_perm.mode &= ~SHM_LOCKED;
+	shp->mlock_user = NULL;
+	get_file(shm_file);
+	ipc_unlock_object(&shp->shm_perm);
+	rcu_read_unlock();
+	shmem_unlock_mapping(shm_file->f_mapping);
+
+	fput(shm_file);
+	return err;
+
+out_unlock0:
+	ipc_unlock_object(&shp->shm_perm);
+out_unlock1:
+	rcu_read_unlock();
+	return err;
+}
+
+long ksys_shmctl(int shmid, int cmd, struct shmid_ds __user *buf)
+{
+	int err, version;
+	struct ipc_namespace *ns;
+	struct shmid64_ds sem64;
+
+	if (cmd < 0 || shmid < 0)
+		return -EINVAL;
+
+	version = ipc_parse_version(&cmd);
+	ns = current->nsproxy->ipc_ns;
+
+	switch (cmd) {
+	case IPC_INFO: {
+		struct shminfo64 shminfo;
+		err = shmctl_ipc_info(ns, &shminfo);
+		if (err < 0)
+			return err;
+		if (copy_shminfo_to_user(buf, &shminfo, version))
+			err = -EFAULT;
+		return err;
+	}
+	case SHM_INFO: {
+		struct shm_info shm_info;
+		err = shmctl_shm_info(ns, &shm_info);
+		if (err < 0)
+			return err;
+		if (copy_to_user(buf, &shm_info, sizeof(shm_info)))
+			err = -EFAULT;
+		return err;
+	}
+	case SHM_STAT:
+	case SHM_STAT_ANY:
+	case IPC_STAT: {
+		err = shmctl_stat(ns, shmid, cmd, &sem64);
+		if (err < 0)
+			return err;
+		if (copy_shmid_to_user(buf, &sem64, version))
+			err = -EFAULT;
+		return err;
+	}
+	case IPC_SET:
+		if (copy_shmid_from_user(&sem64, buf, version))
+			return -EFAULT;
+		/* fallthru */
+	case IPC_RMID:
+		return shmctl_down(ns, shmid, cmd, &sem64);
+	case SHM_LOCK:
+	case SHM_UNLOCK:
+		return shmctl_do_lock(ns, shmid, cmd);
+	default:
+		return -EINVAL;
+	}
+}
+
+SYSCALL_DEFINE3(shmctl, int, shmid, int, cmd, struct shmid_ds __user *, buf)
+{
+	return ksys_shmctl(shmid, cmd, buf);
+}
+
+#ifdef CONFIG_COMPAT
+
+struct compat_shmid_ds {
+	struct compat_ipc_perm shm_perm;
+	int shm_segsz;
+	compat_time_t shm_atime;
+	compat_time_t shm_dtime;
+	compat_time_t shm_ctime;
+	compat_ipc_pid_t shm_cpid;
+	compat_ipc_pid_t shm_lpid;
+	unsigned short shm_nattch;
+	unsigned short shm_unused;
+	compat_uptr_t shm_unused2;
+	compat_uptr_t shm_unused3;
+};
+
+struct compat_shminfo64 {
+	compat_ulong_t shmmax;
+	compat_ulong_t shmmin;
+	compat_ulong_t shmmni;
+	compat_ulong_t shmseg;
+	compat_ulong_t shmall;
+	compat_ulong_t __unused1;
+	compat_ulong_t __unused2;
+	compat_ulong_t __unused3;
+	compat_ulong_t __unused4;
+};
+
+struct compat_shm_info {
+	compat_int_t used_ids;
+	compat_ulong_t shm_tot, shm_rss, shm_swp;
+	compat_ulong_t swap_attempts, swap_successes;
+};
+
+static int copy_compat_shminfo_to_user(void __user *buf, struct shminfo64 *in,
+					int version)
+{
+	if (in->shmmax > INT_MAX)
+		in->shmmax = INT_MAX;
+	if (version == IPC_64) {
+		struct compat_shminfo64 info;
+		memset(&info, 0, sizeof(info));
+		info.shmmax = in->shmmax;
+		info.shmmin = in->shmmin;
+		info.shmmni = in->shmmni;
+		info.shmseg = in->shmseg;
+		info.shmall = in->shmall;
+		return copy_to_user(buf, &info, sizeof(info));
+	} else {
+		struct shminfo info;
+		memset(&info, 0, sizeof(info));
+		info.shmmax = in->shmmax;
+		info.shmmin = in->shmmin;
+		info.shmmni = in->shmmni;
+		info.shmseg = in->shmseg;
+		info.shmall = in->shmall;
+		return copy_to_user(buf, &info, sizeof(info));
+	}
+}
+
+static int put_compat_shm_info(struct shm_info *ip,
+				struct compat_shm_info __user *uip)
+{
+	struct compat_shm_info info;
+
+	memset(&info, 0, sizeof(info));
+	info.used_ids = ip->used_ids;
+	info.shm_tot = ip->shm_tot;
+	info.shm_rss = ip->shm_rss;
+	info.shm_swp = ip->shm_swp;
+	info.swap_attempts = ip->swap_attempts;
+	info.swap_successes = ip->swap_successes;
+	return copy_to_user(uip, &info, sizeof(info));
+}
+
+static int copy_compat_shmid_to_user(void __user *buf, struct shmid64_ds *in,
+					int version)
+{
+	if (version == IPC_64) {
+		struct compat_shmid64_ds v;
+		memset(&v, 0, sizeof(v));
+		to_compat_ipc64_perm(&v.shm_perm, &in->shm_perm);
+		v.shm_atime	 = lower_32_bits(in->shm_atime);
+		v.shm_atime_high = upper_32_bits(in->shm_atime);
+		v.shm_dtime	 = lower_32_bits(in->shm_dtime);
+		v.shm_dtime_high = upper_32_bits(in->shm_dtime);
+		v.shm_ctime	 = lower_32_bits(in->shm_ctime);
+		v.shm_ctime_high = upper_32_bits(in->shm_ctime);
+		v.shm_segsz = in->shm_segsz;
+		v.shm_nattch = in->shm_nattch;
+		v.shm_cpid = in->shm_cpid;
+		v.shm_lpid = in->shm_lpid;
+		return copy_to_user(buf, &v, sizeof(v));
+	} else {
+		struct compat_shmid_ds v;
+		memset(&v, 0, sizeof(v));
+		to_compat_ipc_perm(&v.shm_perm, &in->shm_perm);
+		v.shm_perm.key = in->shm_perm.key;
+		v.shm_atime = in->shm_atime;
+		v.shm_dtime = in->shm_dtime;
+		v.shm_ctime = in->shm_ctime;
+		v.shm_segsz = in->shm_segsz;
+		v.shm_nattch = in->shm_nattch;
+		v.shm_cpid = in->shm_cpid;
+		v.shm_lpid = in->shm_lpid;
+		return copy_to_user(buf, &v, sizeof(v));
+	}
+}
+
+static int copy_compat_shmid_from_user(struct shmid64_ds *out, void __user *buf,
+					int version)
+{
+	memset(out, 0, sizeof(*out));
+	if (version == IPC_64) {
+		struct compat_shmid64_ds __user *p = buf;
+		return get_compat_ipc64_perm(&out->shm_perm, &p->shm_perm);
+	} else {
+		struct compat_shmid_ds __user *p = buf;
+		return get_compat_ipc_perm(&out->shm_perm, &p->shm_perm);
+	}
+}
+
+long compat_ksys_shmctl(int shmid, int cmd, void __user *uptr)
+{
+	struct ipc_namespace *ns;
+	struct shmid64_ds sem64;
+	int version = compat_ipc_parse_version(&cmd);
+	int err;
+
+	ns = current->nsproxy->ipc_ns;
+
+	if (cmd < 0 || shmid < 0)
+		return -EINVAL;
+
+	switch (cmd) {
+	case IPC_INFO: {
+		struct shminfo64 shminfo;
+		err = shmctl_ipc_info(ns, &shminfo);
+		if (err < 0)
+			return err;
+		if (copy_compat_shminfo_to_user(uptr, &shminfo, version))
+			err = -EFAULT;
+		return err;
+	}
+	case SHM_INFO: {
+		struct shm_info shm_info;
+		err = shmctl_shm_info(ns, &shm_info);
+		if (err < 0)
+			return err;
+		if (put_compat_shm_info(&shm_info, uptr))
+			err = -EFAULT;
+		return err;
+	}
+	case IPC_STAT:
+	case SHM_STAT_ANY:
+	case SHM_STAT:
+		err = shmctl_stat(ns, shmid, cmd, &sem64);
+		if (err < 0)
+			return err;
+		if (copy_compat_shmid_to_user(uptr, &sem64, version))
+			err = -EFAULT;
+		return err;
+
+	case IPC_SET:
+		if (copy_compat_shmid_from_user(&sem64, uptr, version))
+			return -EFAULT;
+		/* fallthru */
+	case IPC_RMID:
+		return shmctl_down(ns, shmid, cmd, &sem64);
+	case SHM_LOCK:
+	case SHM_UNLOCK:
+		return shmctl_do_lock(ns, shmid, cmd);
+		break;
+	default:
+		return -EINVAL;
+	}
+	return err;
+}
+
+COMPAT_SYSCALL_DEFINE3(shmctl, int, shmid, int, cmd, void __user *, uptr)
+{
+	return compat_ksys_shmctl(shmid, cmd, uptr);
+}
+#endif
+
+/*
+ * Fix shmaddr, allocate descriptor, map shm, add attach descriptor to lists.
+ *
+ * NOTE! Despite the name, this is NOT a direct system call entrypoint. The
+ * "raddr" thing points to kernel space, and there has to be a wrapper around
+ * this.
+ */
+long do_shmat(int shmid, char __user *shmaddr, int shmflg,
+	      ulong *raddr, unsigned long shmlba)
+{
+	struct shmid_kernel *shp;
+	unsigned long addr = (unsigned long)shmaddr;
+	unsigned long size;
+	struct file *file, *base;
+	int    err;
+	unsigned long flags = MAP_SHARED;
+	unsigned long prot;
+	int acc_mode;
+	struct ipc_namespace *ns;
+	struct shm_file_data *sfd;
+	int f_flags;
+	unsigned long populate = 0;
+
+	err = -EINVAL;
+	if (shmid < 0)
 		goto out;
 
-	i = 0;
-	for_each_hstate(h) {
-		char buf[50];
-		unsigned ps_kb = 1U << (h->order + PAGE_SHIFT - 10);
+	if (addr) {
+		if (addr & (shmlba - 1)) {
+			if (shmflg & SHM_RND) {
+				addr &= ~(shmlba - 1);  /* round down */
 
-		snprintf(buf, sizeof(buf), "pagesize=%uK", ps_kb);
-		hugetlbfs_vfsmount[i] = kern_mount_data(&hugetlbfs_fs_type,
-							buf);
-
-		if (IS_ERR(hugetlbfs_vfsmount[i])) {
-			pr_err("Cannot mount internal hugetlbfs for "
-				"page size %uK", ps_kb);
-			error = PTR_ERR(hugetlbfs_vfsmount[i]);
-			hugetlbfs_vfsmount[i] = NULL;
+				/*
+				 * Ensure that the round-down is non-nil
+				 * when remapping. This can happen for
+				 * cases when addr < shmlba.
+				 */
+				if (!addr && (shmflg & SHM_REMAP))
+					goto out;
+			} else
+#ifndef __ARCH_FORCE_SHMLBA
+				if (addr & ~PAGE_MASK)
+#endif
+					goto out;
 		}
-		i++;
-	}
-	/* Non default hstates are optional */
-	if (!IS_ERR_OR_NULL(hugetlbfs_vfsmount[default_hstate_idx]))
-		return 0;
 
- out:
-	kmem_cache_destroy(hugetlbfs_inode_cachep);
- out2:
-	return error;
+		flags |= MAP_FIXED;
+	} else if ((shmflg & SHM_REMAP))
+		goto out;
+
+	if (shmflg & SHM_RDONLY) {
+		prot = PROT_READ;
+		acc_mode = S_IRUGO;
+		f_flags = O_RDONLY;
+	} else {
+		prot = PROT_READ | PROT_WRITE;
+		acc_mode = S_IRUGO | S_IWUGO;
+		f_flags = O_RDWR;
+	}
+	if (shmflg & SHM_EXEC) {
+		prot |= PROT_EXEC;
+		acc_mode |= S_IXUGO;
+	}
+
+	/*
+	 * We cannot rely on the fs check since SYSV IPC does have an
+	 * additional creator id...
+	 */
+	ns = current->nsproxy->ipc_ns;
+	rcu_read_lock();
+	shp = shm_obtain_object_check(ns, shmid);
+	if (IS_ERR(shp)) {
+		err = PTR_ERR(shp);
+		goto out_unlock;
+	}
+
+	err = -EACCES;
+	if (ipcperms(ns, &shp->shm_perm, acc_mode))
+		goto out_unlock;
+
+	err = security_shm_shmat(&shp->shm_perm, shmaddr, shmflg);
+	if (err)
+		goto out_unlock;
+
+	ipc_lock_object(&shp->shm_perm);
+
+	/* check if shm_destroy() is tearing down shp */
+	if (!ipc_valid_object(&shp->shm_perm)) {
+		ipc_unlock_object(&shp->shm_perm);
+		err = -EIDRM;
+		goto out_unlock;
+	}
+
+	/*
+	 * We need to take a reference to the real shm file to prevent the
+	 * pointer from becoming stale in cases where the lifetime of the outer
+	 * file extends beyond that of the shm segment.  It's not usually
+	 * possible, but it can happen during remap_file_pages() emulation as
+	 * that unmaps the memory, then does ->mmap() via file reference only.
+	 * We'll deny the ->mmap() if the shm segment was since removed, but to
+	 * detect shm ID reuse we need to compare the file pointers.
+	 */
+	base = get_file(shp->shm_file);
+	shp->shm_nattch++;
+	size = i_size_read(file_inode(base));
+	ipc_unlock_object(&shp->shm_perm);
+	rcu_read_unlock();
+
+	err = -ENOMEM;
+	sfd = kzalloc(sizeof(*sfd), GFP_KERNEL);
+	if (!sfd) {
+		fput(base);
+		goto out_nattch;
+	}
+
+	file = alloc_file_clone(base, f_flags,
+			  is_file_hugepages(base) ?
+				&shm_file_operations_huge :
+				&shm_file_operations);
+	err = PTR_ERR(file);
+	if (IS_ERR(file)) {
+		kfree(sfd);
+		fput(base);
+		goto out_nattch;
+	}
+
+	sfd->id = shp->shm_perm.id;
+	sfd->ns = get_ipc_ns(ns);
+	sfd->file = base;
+	sfd->vm_ops = NULL;
+	file->private_data = sfd;
+
+	err = security_mmap_file(file, prot, flags);
+	if (err)
+		goto out_fput;
+
+	if (down_write_killable(&current->mm->mmap_sem)) {
+		err = -EINTR;
+		goto out_fput;
+	}
+
+	if (addr && !(shmflg & SHM_REMAP)) {
+		err = -EINVAL;
+		if (addr + size < addr)
+			goto invalid;
+
+		if (find_vma_intersection(current->mm, addr, addr + size))
+			goto invalid;
+	}
+
+	addr = do_mmap_pgoff(file, addr, size, prot, flags, 0, &populate, NULL);
+	*raddr = addr;
+	err = 0;
+	if (IS_ERR_VALUE(addr))
+		err = (long)addr;
+invalid:
+	up_write(&current->mm->mmap_sem);
+	if (populate)
+		mm_populate(addr, populate);
+
+out_fput:
+	fput(file);
+
+out_nattch:
+	down_write(&shm_ids(ns).rwsem);
+	shp = shm_lock(ns, shmid);
+	shp->shm_nattch--;
+
+	if (shm_may_destroy(shp))
+		shm_destroy(ns, shp);
+	else
+		shm_unlock(shp);
+	up_write(&shm_ids(ns).rwsem);
+	return err;
+
+out_unlock:
+	rcu_read_unlock();
+out:
+	return err;
 }
-fs_initcall(init_hugetlbfs_fs)
+
+SYSCALL_DEFINE3(shmat, int, shmid, char __user *, shmaddr, int, shmflg)
+{
+	unsigned long ret;
+	long err;
+
+	err = do_shmat(shmid, shmaddr, shmflg, &ret, SHMLBA);
+	if (err)
+		return err;
+	force_successful_syscall_return();
+	return (long)ret;
+}
+
+#ifdef CONFIG_COMPAT
+
+#ifndef COMPAT_SHMLBA
+#define COMPAT_SHMLBA	SHMLBA
+#endif
+
+COMPAT_SYSCALL_DEFINE3(shmat, int, shmid, compat_uptr_t, shmaddr, int, shmflg)
+{
+	unsigned long ret;
+	long err;
+
+	err = do_shmat(shmid, compat_ptr(shmaddr), shmflg, &ret, COMPAT_SHMLBA);
+	if (err)
+		return err;
+	force_successful_syscall_return();
+	return (long)ret;
+}
+#endif
+
+/*
+ * detach and kill segment if marked destroyed.
+ * The work is done in shm_close.
+ */
+long ksys_shmdt(char __user *shmaddr)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long addr = (unsigned long)shmaddr;
+	int retval = -EINVAL;
+#ifdef CONFIG_MMU
+	loff_t size = 0;
+	struct file *file;
+	struct vm_area_struct *next;
+#endif
+
+	if (addr & ~PAGE_MASK)
+		return retval;
+
+	if (down_write_killable(&mm->mmap_sem))
+		return -EINTR;
+
+	/*
+	 * This function tries to be smart and unmap shm segments that
+	 * were modified by partial mlock or munmap calls:
+	 * - It first determines the size of the shm segment that should be
+	 *   unmapped: It searches for a vma that is backed by shm and that
+	 *   started at address shmaddr. It records it's size and then unmaps
+	 *   it.
+	 * - Then it unmaps all shm vmas that started at shmaddr and that
+	 *   are within the initially determined size and that are from the
+	 *   same shm segment from which we determined the size.
+	 * Errors from do_munmap are ignored: the function only fails if
+	 * it's called with invalid parameters or if it's called to unmap
+	 * a part of a vma. Both calls in this function are for full vmas,
+	 * the parameters are directly copied from the vma itself and always
+	 * valid - therefore do_munmap cannot fail. (famous last words?)
+	 */
+	/*
+	 * If it had been mremap()'d, the starting address would not
+	 * match the usual checks anyway. So assume all vma's are
+	 * above the starting address given.
+	 */
+	vma = find_vma(mm, addr);
+
+#ifdef CONFIG_MMU
+	while (vma) {
+		next = vma->vm_next;
+
+		/*
+		 * Check if the starting address would match, i.e. it's
+		 * a fragment created by mprotect() and/or munmap(), or it
+		 * otherwise it starts at this address with no hassles.
+		 */
+		if ((vma->vm_ops == &shm_vm_ops) &&
+			(vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) {
+
+			/*
+			 * Record the file of the shm segment being
+			 * unmapped.  With mremap(), someone could place
+			 * page from another segment but with equal offsets
+			 * in the range we are unmapping.
+			 */
+			file = vma->vm_file;
+			size = i_size_read(file_inode(vma->vm_file));
+			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
+			/*
+			 * We discovered the size of the shm segment, so
+			 * break out of here and fall through to the next
+			 * loop that uses the size information to stop
+			 * searching for matching vma's.
+			 */
+			retval = 0;
+			vma = next;
+			break;
+		}
+		vma = next;
+	}
+
+	/*
+	 * We need look no further than the maximum address a fragment
+	 * could possibly have landed at. Also cast things to loff_t to
+	 * prevent overflows and make comparisons vs. equal-width types.
+	 */
+	size = PAGE_ALIGN(size);
+	while (vma && (loff_t)(vma->vm_end - addr) <= size) {
+		next = vma->vm_next;
+
+		/* finding a matching vma now does not alter retval */
+		if ((vma->vm_ops == &shm_vm_ops) &&
+		    ((vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) &&
+		    (vma->vm_file == file))
+			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
+		vma = next;
+	}
+
+#else	/* CONFIG_MMU */
+	/* under NOMMU conditions, the exact address to be destroyed must be
+	 * given
+	 */
+	if (vma && vma->vm_start == addr && vma->vm_ops == &shm_vm_ops) {
+		do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
+		retval = 0;
+	}
+
+#endif
+
+	up_write(&mm->mmap_sem);
+	return retval;
+}
+
+SYSCALL_DEFINE1(shmdt, char __user *, shmaddr)
+{
+	return ksys_shmdt(shmaddr);
+}
+
+#ifdef CONFIG_PROC_FS
+static int sysvipc_shm_proc_show(struct seq_file *s, void *it)
+{
+	struct pid_namespace *pid_ns = ipc_seq_pid_ns(s);
+	struct user_namespace *user_ns = seq_user_ns(s);
+	struct kern_ipc_perm *ipcp = it;
+	struct shmid_kernel *shp;
+	unsigned long rss = 0, swp = 0;
+
+	shp = container_of(ipcp, struct shmid_kernel, shm_perm);
+	shm_add_rss_swap(shp, &rss, &swp);
+
+#if BITS_PER_LONG <= 32
+#define SIZE_SPEC "%10lu"
+#else
+#define SIZE_SPEC "%21lu"
+#endif
+
+	seq_printf(s,
+		   "%10d %10d  %4o " SIZE_SPEC " %5u %5u  "
+		   "%5lu %5u %5u %5u %5u %10llu %10llu %10llu "
+		   SIZE_SPEC " " SIZE_SPEC "\n",
+		   shp->shm_perm.key,
+		   shp->shm_perm.id,
+		   shp->shm_perm.mode,
+		   shp->shm_segsz,
+		   pid_nr_ns(shp->shm_cprid, pid_ns),
+		   pid_nr_ns(shp->shm_lprid, pid_ns),
+		   shp->shm_nattch,
+		   from_kuid_munged(user_ns, shp->shm_perm.uid),
+		   from_kgid_munged(user_ns, shp->shm_perm.gid),
+		   from_kuid_munged(user_ns, shp->shm_perm.cuid),
+		   from_kgid_munged(user_ns, shp->shm_perm.cgid),
+		   shp->shm_atim,
+		   shp->shm_dtim,
+		   shp->shm_ctim,
+		   rss * PAGE_SIZE,
+		   swp * PAGE_SIZE);
+
+	return 0;
+}
+#endif
